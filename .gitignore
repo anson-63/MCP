@@ -1,0 +1,39 @@
+# Eclipse
+.settings/
+.project
+.classpath
+.factorypath
+
+# Maven
+target/
+*.war
+
+# IntelliJ
+.idea/
+*.iml
+
+# Compiled
+bin/
+*.class
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# SECRETS - never commit!
+.env
+*.env
+!.env.example
+src/main/resources/.env
+
+# Maven dependencies
+src/main/webapp/WEB-INF/lib/
+
+# Backups
+*~
+*.bak
+*.swp
