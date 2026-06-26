@@ -8,6 +8,11 @@ import org.slf4j.LoggerFactory;
 import java.util.*;
 import java.util.function.Function;
 
+import com.ais.model.LocationResult;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.Map;
+
 public class MCPClientService {
 
     private final ObjectMapper mapper = new ObjectMapper();
@@ -488,5 +493,41 @@ public class MCPClientService {
     // ── Error JSON ────────────────────────────────────────────────
     private String errorJson(String message) {
         return "{\"error\": \"" + message.replace("\"", "'") + "\"}";
+    }
+    
+    /**
+     * Run a tool and return a list of LocationResult objects.
+     * Used by PipelineExecutor for PRIMARY and SECONDARY steps.
+     */
+    public List<LocationResult> runList(String toolName, Map<String, Object> args) {
+        log.info("🔧 runList: tool={}", toolName);
+        // Wire to your existing tool execution logic
+        // Example — adapt to match your actual tool dispatch:
+        try {
+            String raw = callTool(toolName, args);
+            return parseToLocationResults(raw);
+        } catch (Exception e) {
+            log.error("runList failed for tool={}", toolName, e);
+            return new ArrayList<>();
+        }
+    }
+
+    public String runDetail(String toolName, Map<String, Object> args) {
+        log.info("🔧 runDetail: tool={}", toolName);
+        try {
+            return callTool(toolName, args);
+        } catch (Exception e) {
+            log.error("runDetail failed for tool={}", toolName, e);
+            return null;
+        }
+    }
+
+    private List<LocationResult> parseToLocationResults(String raw) {
+        List<LocationResult> results = new ArrayList<>();
+        if (raw == null || raw.trim().isEmpty()) return results;
+        // Wire to your existing result parsing — 
+        // if callTool already returns structured data via another path,
+        // use that instead
+        return results;
     }
 }

@@ -21,38 +21,30 @@ import java.security.cert.X509Certificate;
 
 import com.ais.config.AppConfig;
 import com.ais.db.DatabaseManager;
+import com.ais.model.ExtractedKeywords;
+import com.ais.service.Intent;
+import com.ais.service.IntentRole;
+import com.ais.service.Plan;
+import com.ais.service.PipelineExecutor;
 
 public class OllamaService {
-    //══════════════════════════════════════════════════════════════
-    //EXTRACTED KEYWORDS — result of LLM pre-processing
-    //══════════════════════════════════════════════════════════════
-
-    public static class ExtractedKeywords {
-
-        public String intent;           // MONUMENT / HISTORIC / LOCATION_CODE / etc.
-        public String locationCode;     // SB04400361000
-        public String locationName;     // Sha Tin / Lo Wu
-        public String reportType;       // BSI / KAI / DSSR
-        public String department;       // LCSD / AFCD
-        public String psm;              // SHA TIN EAST
-        public String grade;            // 1 / 2 / 3 / ALL
-        public String filter;           // T / F / ALL
-        public String modifier;         // OLDEST / NEWEST / COUNT
-        public List<String> rawKeywords = new ArrayList<String>();
-
-        @Override
-        public String toString() {
-            return String.format(
-                    "ExtractedKeywords{intent=%s, location=%s, code=%s, "
-                    + "modifier=%s, dept=%s, grade=%s, filter=%s, report=%s}",
-                    intent, locationName, locationCode,
-                    modifier, department, grade, filter, reportType
-            );
-        }
-    }
 
     private static final Logger log = LoggerFactory.getLogger(OllamaService.class);
-
+    
+    private static final int KW_CACHE_MAX = 50;
+    
+    private static final Map<String, ExtractedKeywords> kwCache =
+            Collections.synchronizedMap(
+                new java.util.LinkedHashMap<String, ExtractedKeywords>(
+                        KW_CACHE_MAX, 0.75f, true) {
+                    @Override
+                    protected boolean removeEldestEntry(
+                            Map.Entry<String, ExtractedKeywords> eldest) {
+                        return size() > KW_CACHE_MAX;
+                    }
+                }
+            );
+    
     // ── Read from config (no more hardcoded values!) ──────────────
     private static final String OLLAMA_URL
             = AppConfig.ollamaBaseUrl() + "/api/chat";
@@ -104,182 +96,183 @@ public class OllamaService {
             + "Example: 'Here are the details for Sha Tin Park:'";
     
     private static final String KEYWORD_EXTRACT_PROMPT =
-    	    "You are a keyword extractor for a location database system.\n\n"
-    	    + "Extract keywords from the user's query and return ONLY valid JSON.\n\n"
-    	    + "JSON fields:\n"
-    	    + "- intent: one of [LOCATION_CODE, NAME_SEARCH, MONUMENT, HISTORIC, "
-    	    +   "DEPARTMENT, PSM, REPORT, CODE_HISTORY, SQL_QUERY, UNKNOWN]\n"
-    	    + "- locationCode: exact location code if mentioned (e.g. SB04400361000), else null\n"
-    	    + "- locationName: place/district name if mentioned (e.g. Sha Tin, Lo Wu), else null\n"
-    	    + "- reportType: report type if mentioned (BSI/KAI/DSSR/EMMS/CSR), else null\n"
-    	    + "- department: department code if mentioned (LCSD/AFCD/HD/DSD), else null\n"
-    	    + "- psm: PSM name if mentioned (e.g. SHA TIN EAST), else null\n"
-    	    + "- grade: historic building grade if mentioned (1/2/3/ALL), else null\n"
-    	    + "- filter: for monuments T=declared, F=non, ALL=both, else null\n"
-    	    + "- modifier: for CODE_HISTORY use FETCH_CURRENT (fetch details of new code) "
-    	    +   "or null (just show history). "
-    	    +   "For other intents use: OLDEST, NEWEST, FIRST, LATEST, ALL, COUNT. "
-    	    +   "Never invent new modifier values.\n"
-    	    + "- rawKeywords: array of important words from the query\n\n"
+            "You are a keyword extractor for a location database system.\n\n"
+            + "Extract keywords from the user's query and return ONLY valid JSON.\n\n"
+            + "JSON fields:\n"
+            + "- intents: ARRAY of one or more intent strings. "
+            +   "Valid values: LOCATION_CODE, NAME_SEARCH, MONUMENT, HISTORIC, "
+            +   "DEPARTMENT, PSM, REPORT, CODE_HISTORY, SQL_QUERY, UNKNOWN. "
+            +   "Use multiple values when the query combines two concepts.\n"
+            + "- locationCode: exact location code if mentioned (e.g. SB04400361000), else null\n"
+            + "- locationName: place/district name if mentioned (e.g. Sha Tin, Lo Wu), else null\n"
+            + "- reportType: report type if mentioned (BSI/KAI/DSSR/EMMS/CSR/ALL), else null\n"
+            + "- department: department code if mentioned (LCSD/AFCD/HD/DSD), else null\n"
+            + "- psm: PSM name if mentioned (e.g. SHA TIN EAST), else null\n"
+            + "- grade: historic building grade if mentioned (1/2/3/ALL), else null\n"
+            + "- filter: for monuments T=declared, F=non, ALL=both, else null\n"
+            + "- modifier: for CODE_HISTORY use FETCH_CURRENT, else OLDEST, NEWEST, FIRST, LATEST, ALL, COUNT. Never invent new modifier values.\n"
+            + "- rawKeywords: array of important words from the query\n\n"
 
-    	    + "INTENT RULES:\n"
-    	    + "- LOCATION_CODE: user mentions a location code AND wants details/info about it\n"
-    	    + "- REPORT: user mentions a location code AND a specific report type (BSI/KAI/DSSR/EMMS/CSR)\n"
-    	    + "- NAME_SEARCH: user searches by place name without a code\n"
-    	    + "- MONUMENT: user asks about declared monuments\n"
-    	    + "- HISTORIC: user asks about historic/graded buildings\n"
-    	    + "- DEPARTMENT: user asks about a department code\n"
-    	    + "- PSM: user asks about a PSM\n"
-    	    + "- CODE_HISTORY: user asks about former/current/old/new codes\n"
-    	    + "- SQL_QUERY: user asks a cross-table question that requires custom SQL — "
-    	    +   "e.g. 'which locations have all reports', 'any code has all 5 reports', "
-    	    +   "'how many locations have BSI and KAI', 'find locations with both X and Y'\n"
-    	    + "- UNKNOWN: cannot determine intent\n\n"
+            + "INTENT RULES:\n"
+            + "- LOCATION_CODE: user mentions a location code AND wants details/info about it\n"
+            + "- REPORT: user provides one or more specific location codes AND asks to check reports for them (e.g. 'check all 5 reports for QA03206005000 QB03106003000').\n"
+            + "- NAME_SEARCH: user searches by place name without a code\n"
+            + "- MONUMENT: user asks about declared monuments\n"
+            + "- HISTORIC: user asks about historic/graded buildings\n"
+            + "- DEPARTMENT: user asks about a department code OR asks which department manages a location/place.\n"
+            + "- PSM: user asks about a PSM OR asks to list all PSMs.\n"
+            + "- CODE_HISTORY: user asks about former/current/old/new codes\n"
+            + "- SQL_QUERY: user asks a cross-table question across ALL locations without providing specific location codes (e.g. 'any location code has all 5 reports?'). Do NOT use SQL_QUERY if the user provides specific location codes!\n"
+            + "- UNKNOWN: cannot determine intent\n\n"
 
-    	    + "IMPORTANT:\n"
-    	    + "- If a location code is present but NO specific report type is mentioned, "
-    	    +   "use LOCATION_CODE not REPORT.\n"
-    	    + "- Only use REPORT if user explicitly mentions BSI, KAI, DSSR, EMMS, or CSR "
-    	    +   "AND provides a location code.\n"
-    	    + "- Use SQL_QUERY when the user asks about report combinations across ALL locations "
-    	    +   "without providing specific codes.\n\n"
+            + "IMPORTANT:\n"
+            + "- If a location code is present but NO specific report type is mentioned, use LOCATION_CODE not REPORT.\n"
+            + "- If the user provides specific location codes and asks to check reports, use REPORT and put all codes in locationCode.\n"
+            + "- Use SQL_QUERY ONLY when asking about report combinations across ALL locations without providing specific codes.\n\n"
 
-    	    + "Examples:\n"
+            + "Examples:\n"
 
-    	    // ... existing examples unchanged ...
+            // ── NEW: REPORT vs SQL_QUERY examples ──────────────────────────
+            + "Query: 'check all 5 reports for QA03206005000 QB03106003000 QC02306006000'\n"
+            + "Output: {\"intents\":[\"REPORT\"],\"locationCode\":\"QA03206005000,QB03106003000,QC02306006000\",\"locationName\":null,"
+            +   "\"reportType\":\"ALL\",\"department\":null,\"psm\":null,\"grade\":null,"
+            +   "\"filter\":null,\"modifier\":null,\"rawKeywords\":[\"check all 5 reports\",\"QA03206005000\",\"QB03106003000\",\"QC02306006000\"]}\n\n"
 
-    	    // ── NEW: SQL_QUERY examples ────────────────────────────────────
-    	    + "Query: 'any location code has all 5 reports?'\n"
-    	    + "Output: {\"intent\":\"SQL_QUERY\",\"locationCode\":null,\"locationName\":null,"
-    	    +   "\"reportType\":null,\"department\":null,\"psm\":null,\"grade\":null,"
-    	    +   "\"filter\":null,\"modifier\":null,"
-    	    +   "\"rawKeywords\":[\"all 5 reports\",\"location code\"]}\n\n"
+            + "Query: 'any location code has all 5 reports?'\n"
+            + "Output: {\"intents\":[\"SQL_QUERY\"],\"locationCode\":null,\"locationName\":null,"
+            +   "\"reportType\":null,\"department\":null,\"psm\":null,\"grade\":null,"
+            +   "\"filter\":null,\"modifier\":null,\"rawKeywords\":[\"all 5 reports\",\"location code\"]}\n\n"
 
-    	    + "Query: 'any location code has all 5 reports in Hong Kong island?'\n"
-    	    + "Output: {\"intent\":\"SQL_QUERY\",\"locationCode\":null,"
-    	    +   "\"locationName\":\"Hong Kong island\",\"reportType\":null,"
-    	    +   "\"department\":null,\"psm\":null,\"grade\":null,\"filter\":null,"
-    	    +   "\"modifier\":null,\"rawKeywords\":[\"all 5 reports\",\"Hong Kong island\"]}\n\n"
+            // ── PSM examples ───────────────────────────────────────────────
+            + "Query: 'List all PSMs'\n"
+            + "Output: {\"intents\":[\"PSM\"],\"locationCode\":null,\"locationName\":null,"
+            +   "\"reportType\":null,\"department\":null,\"psm\":null,\"grade\":null,"
+            +   "\"filter\":null,\"modifier\":null,\"rawKeywords\":[\"List all PSMs\"]}\n\n"
 
-    	    + "Query: 'any location code has all 5 reports in central?'\n"
-    	    + "Output: {\"intent\":\"SQL_QUERY\",\"locationCode\":null,"
-    	    +   "\"locationName\":\"central\",\"reportType\":null,"
-    	    +   "\"department\":null,\"psm\":null,\"grade\":null,\"filter\":null,"
-    	    +   "\"modifier\":null,\"rawKeywords\":[\"all 5 reports\",\"central\"]}\n\n"
+            + "Query: 'info of first location code under PSM/KT'\n"
+            + "Output: {\"intents\":[\"PSM\",\"CODE_HISTORY\"],\"locationCode\":null,\"locationName\":null,"
+            +   "\"reportType\":null,\"department\":null,\"psm\":\"KT\",\"grade\":null,"
+            +   "\"filter\":null,\"modifier\":\"FIRST\",\"rawKeywords\":[\"info\",\"first\",\"location code\",\"PSM\",\"KT\"]}\n\n"
 
-    	    + "Query: 'which locations have both BSI and KAI reports?'\n"
-    	    + "Output: {\"intent\":\"SQL_QUERY\",\"locationCode\":null,\"locationName\":null,"
-    	    +   "\"reportType\":\"BSI,KAI\",\"department\":null,\"psm\":null,\"grade\":null,"
-    	    +   "\"filter\":null,\"modifier\":null,"
-    	    +   "\"rawKeywords\":[\"BSI\",\"KAI\",\"locations\"]}\n\n"
+            // ── Attribute vs Filter examples ───────────────────────────────
+            + "Query: 'Show department managing UC07300217003'\n"
+            + "Output: {\"intents\":[\"LOCATION_CODE\",\"DEPARTMENT\"],\"locationCode\":\"UC07300217003\",\"locationName\":null,"
+            +   "\"reportType\":null,\"department\":null,\"psm\":null,\"grade\":null,"
+            +   "\"filter\":null,\"modifier\":null,\"rawKeywords\":[\"department\",\"managing\",\"UC07300217003\"]}\n\n"
 
-    	    + "Query: 'how many LCSD locations have BSI report?'\n"
-    	    + "Output: {\"intent\":\"SQL_QUERY\",\"locationCode\":null,\"locationName\":null,"
-    	    +   "\"reportType\":\"BSI\",\"department\":\"LCSD\",\"psm\":null,\"grade\":null,"
-    	    +   "\"filter\":null,\"modifier\":\"COUNT\","
-    	    +   "\"rawKeywords\":[\"LCSD\",\"BSI\",\"how many\"]}\n\n"
-    	    
-    	 // ── NEW: "new code / current code + info" → CODE_HISTORY with chaining ──
-    	    + "Query: 'info of new code of UD04400253000'\n"
-    	    + "Output: {\"intent\":\"CODE_HISTORY\",\"locationCode\":\"UD04400253000\","
-    	    +   "\"locationName\":null,\"reportType\":null,\"department\":null,"
-    	    +   "\"psm\":null,\"grade\":null,\"filter\":null,\"modifier\":\"FETCH_CURRENT\","
-    	    +   "\"rawKeywords\":[\"new code\",\"info\",\"UD04400253000\"]}\n\n"
+            + "Query: 'show departments for locations in Lo Wu'\n"
+            + "Output: {\"intents\":[\"NAME_SEARCH\",\"DEPARTMENT\"],\"locationCode\":null,\"locationName\":\"Lo Wu\","
+            +   "\"reportType\":null,\"department\":null,\"psm\":null,\"grade\":null,"
+            +   "\"filter\":null,\"modifier\":null,\"rawKeywords\":[\"departments\",\"locations\",\"Lo Wu\"]}\n\n"
 
-    	    + "Query: 'get details of current code for UD04400253000'\n"
-    	    + "Output: {\"intent\":\"CODE_HISTORY\",\"locationCode\":\"UD04400253000\","
-    	    +   "\"locationName\":null,\"reportType\":null,\"department\":null,"
-    	    +   "\"psm\":null,\"grade\":null,\"filter\":null,\"modifier\":\"FETCH_CURRENT\","
-    	    +   "\"rawKeywords\":[\"current code\",\"details\",\"UD04400253000\"]}\n\n"
+            + "Query: 'any location code has all 5 reports in Hong Kong island?'\n"
+            + "Output: {\"intents\":[\"SQL_QUERY\"],\"locationCode\":null,\"locationName\":\"Hong Kong island\",\"reportType\":null,\"department\":null,\"psm\":null,\"grade\":null,\"filter\":null,\"modifier\":null,\"rawKeywords\":[\"all 5 reports\",\"Hong Kong island\"]}\n\n"
 
-    	    + "Query: 'show current location for UD04400253000'\n"
-    	    + "Output: {\"intent\":\"CODE_HISTORY\",\"locationCode\":\"UD04400253000\","
-    	    +   "\"locationName\":null,\"reportType\":null,\"department\":null,"
-    	    +   "\"psm\":null,\"grade\":null,\"filter\":null,\"modifier\":\"FETCH_CURRENT\","
-    	    +   "\"rawKeywords\":[\"current location\",\"UD04400253000\"]}\n\n"
-    	    
-			+ "Query: 'Search location code history for UD04400253000'\n"
-			+ "Output: {\"intent\":\"CODE_HISTORY\",\"locationCode\":\"UD04400253000\","
-			+   "\"locationName\":null,\"reportType\":null,\"department\":null,"
-			+   "\"psm\":null,\"grade\":null,\"filter\":null,\"modifier\":null,"
-			+   "\"rawKeywords\":[\"location code history\",\"UD04400253000\"]}\n\n"
-			
-			+ "Query: 'what is the new code for UD04400253000'\n"
-			+ "Output: {\"intent\":\"CODE_HISTORY\",\"locationCode\":\"UD04400253000\","
-			+   "\"locationName\":null,\"reportType\":null,\"department\":null,"
-			+   "\"psm\":null,\"grade\":null,\"filter\":null,\"modifier\":null,"
-			+   "\"rawKeywords\":[\"new code\",\"UD04400253000\"]}\n\n"
+            + "Query: 'any location code has all 5 reports in central?'\n"
+            + "Output: {\"intents\":[\"SQL_QUERY\"],\"locationCode\":null,\"locationName\":\"central\",\"reportType\":null,\"department\":null,\"psm\":null,\"grade\":null,\"filter\":null,\"modifier\":null,\"rawKeywords\":[\"all 5 reports\",\"central\"]}\n\n"
 
-    	    + "Return ONLY the JSON object. No explanation. No markdown. /nothink";
+            + "Query: 'which locations have both BSI and KAI reports?'\n"
+            + "Output: {\"intents\":[\"SQL_QUERY\"],\"locationCode\":null,\"locationName\":null,\"reportType\":\"BSI,KAI\",\"department\":null,\"psm\":null,\"grade\":null,\"filter\":null,\"modifier\":null,\"rawKeywords\":[\"BSI\",\"KAI\",\"locations\"]}\n\n"
+
+            + "Query: 'how many LCSD locations have BSI report?'\n"
+            + "Output: {\"intents\":[\"SQL_QUERY\"],\"locationCode\":null,\"locationName\":null,\"reportType\":\"BSI\",\"department\":\"LCSD\",\"psm\":null,\"grade\":null,\"filter\":null,\"modifier\":\"COUNT\",\"rawKeywords\":[\"LCSD\",\"BSI\",\"how many\"]}\n\n"
+
+            + "Query: 'info of new code of UD04400253000'\n"
+            + "Output: {\"intents\":[\"CODE_HISTORY\"],\"locationCode\":\"UD04400253000\",\"locationName\":null,\"reportType\":null,\"department\":null,\"psm\":null,\"grade\":null,\"filter\":null,\"modifier\":\"FETCH_CURRENT\",\"rawKeywords\":[\"new code\",\"info\",\"UD04400253000\"]}\n\n"
+
+            + "Query: 'get details of current code for UD04400253000'\n"
+            + "Output: {\"intents\":[\"CODE_HISTORY\"],\"locationCode\":\"UD04400253000\",\"locationName\":null,\"reportType\":null,\"department\":null,\"psm\":null,\"grade\":null,\"filter\":null,\"modifier\":\"FETCH_CURRENT\",\"rawKeywords\":[\"current code\",\"details\",\"UD04400253000\"]}\n\n"
+
+            + "Query: 'show current location for UD04400253000'\n"
+            + "Output: {\"intents\":[\"CODE_HISTORY\"],\"locationCode\":\"UD04400253000\",\"locationName\":null,\"reportType\":null,\"department\":null,\"psm\":null,\"grade\":null,\"filter\":null,\"modifier\":\"FETCH_CURRENT\",\"rawKeywords\":[\"current location\",\"UD04400253000\"]}\n\n"
+
+            + "Query: 'Search location code history for UD04400253000'\n"
+            + "Output: {\"intents\":[\"CODE_HISTORY\"],\"locationCode\":\"UD04400253000\",\"locationName\":null,\"reportType\":null,\"department\":null,\"psm\":null,\"grade\":null,\"filter\":null,\"modifier\":null,\"rawKeywords\":[\"location code history\",\"UD04400253000\"]}\n\n"
+
+            + "Query: 'what is the new code for UD04400253000'\n"
+            + "Output: {\"intents\":[\"CODE_HISTORY\"],\"locationCode\":\"UD04400253000\",\"locationName\":null,\"reportType\":null,\"department\":null,\"psm\":null,\"grade\":null,\"filter\":null,\"modifier\":null,\"rawKeywords\":[\"new code\",\"UD04400253000\"]}\n\n"
+
+            + "Query: 'Show historic grade of declared monuments'\n"
+            + "Output: {\"intents\":[\"MONUMENT\",\"HISTORIC\"],\"locationCode\":null,\"locationName\":null,\"reportType\":null,\"department\":null,\"psm\":null,\"grade\":\"ALL\",\"filter\":\"T\",\"modifier\":null,\"rawKeywords\":[\"historic grade\",\"declared monuments\"]}\n\n"
+
+            + "Query: 'Do any monuments in Sha Tin have BSI reports?'\n"
+            + "Output: {\"intents\":[\"MONUMENT\",\"REPORT\"],\"locationCode\":null,\"locationName\":\"Sha Tin\",\"reportType\":\"BSI\",\"department\":null,\"psm\":null,\"grade\":null,\"filter\":\"T\",\"modifier\":null,\"rawKeywords\":[\"monuments\",\"Sha Tin\",\"BSI\"]}\n\n"
+
+            + "Query: 'Which LCSD monuments are historic buildings?'\n"
+            + "Output: {\"intents\":[\"MONUMENT\",\"HISTORIC\",\"DEPARTMENT\"],\"locationCode\":null,\"locationName\":null,\"reportType\":null,\"department\":\"LCSD\",\"psm\":null,\"grade\":\"ALL\",\"filter\":\"T\",\"modifier\":null,\"rawKeywords\":[\"LCSD\",\"monuments\",\"historic\"]}\n\n"
+
+            + "Query: 'Show historic buildings under PSM/SHA TIN EAST'\n"
+            + "Output: {\"intents\":[\"HISTORIC\",\"PSM\"],\"locationCode\":null,\"locationName\":null,\"reportType\":null,\"department\":null,\"psm\":\"SHA TIN EAST\",\"grade\":\"ALL\",\"filter\":null,\"modifier\":null,\"rawKeywords\":[\"historic buildings\",\"SHA TIN EAST\"]}\n\n"
+
+            + "Query: 'Which department manages oldest monument in Sha Tin?'\n"
+            + "Output: {\"intents\":[\"MONUMENT\"],\"locationCode\":null,\"locationName\":\"Sha Tin\",\"reportType\":null,\"department\":null,\"psm\":null,\"grade\":null,\"filter\":\"T\",\"modifier\":\"OLDEST\",\"rawKeywords\":[\"department\",\"oldest\",\"monument\",\"Sha Tin\"]}\n\n"
+
+            + "Return ONLY the JSON object. No explanation. No markdown. /nothink";
     
     private static final String SQL_GENERATE_PROMPT =
-    	    "You are a SQL query generator for a SQL Server database.\n\n"
-    	    + "Generate a single valid T-SQL SELECT query to answer the user's question.\n\n"
-    	    + "AVAILABLE TABLES (copy these names EXACTLY — do not modify them):\n"
-    	    + "- ais.A_GENERAL_INFO           columns: LOC_CD, LOC_NAME, ADDRESS, DEPT_CD, DEPT_DESC, PSM, BLDG_COMPLETION_YEAR\n"
-    	    + "- ais.BSI_GENERAL_INFO         columns: LOC_CD, BLDG_SAFETY_INSP_REPORT_NO, CREATE_TIME\n"
-    	    + "- ais.CS_PLAN                  columns: LOC_CD, FILE_PATH_AUTOCAD\n"
-    	    + "- ais.KAI_RECORD_PLANS_AND_DRAWINGS  columns: LOC_CD, AUTOCAD_PATH\n"
-    	    //   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ spelled out very clearly
-    	    + "- ais.OLD_EMMS                 columns: LOC_CD, REPORT_LINK\n"
-    	    + "- ais.DSSR_REPORT              columns: LOC_CD, REPORT_NO\n"
-    	    + "- GIS_DB.sde.T_ASD_COMBINED    columns: LOC_CD, DECLR_MONUMT, GRD_HIST_BLDG, BLDG_COMP_YEAR\n"
-    	    + "- ais.A_LOC_CD_CHANGE_HISTORY  columns: FORMER_LOC_CD, CURRENT_LOC_CD\n\n"
+            "You are a SQL query generator for a SQL Server database.\n\n"
+            + "Generate a single valid T-SQL SELECT query to answer the user's question.\n\n"
+            + "AVAILABLE TABLES (copy these names EXACTLY — do not modify them):\n"
+            + "- ais.A_GENERAL_INFO           columns: LOC_CD, LOC_NAME, ADDRESS, DEPT_CD, DEPT_DESC, PSM, BLDG_COMPLETION_YEAR\n"
+            + "- ais.BSI_GENERAL_INFO         columns: LOC_CD, BLDG_SAFETY_INSP_REPORT_NO, CREATE_TIME\n"
+            + "- ais.CS_PLAN                  columns: LOC_CD, FILE_PATH_AUTOCAD\n"
+            + "- ais.KAI_RECORD_PLANS_AND_DRAWINGS  columns: LOC_CD, AUTOCAD_PATH\n"
+            + "- ais.OLD_EMMS                 columns: LOC_CD, REPORT_LINK\n"
+            + "- ais.DSSR_REPORT              columns: LOC_CD, REPORT_NO\n"
+            + "- GIS_DB.sde.T_ASD_COMBINED    columns: LOC_CD, DECLR_MONUMT, GRD_HIST_BLDG, BLDG_COMP_YEAR\n"
+            + "- ais.A_LOC_CD_CHANGE_HISTORY  columns: FORMER_LOC_CD, CURRENT_LOC_CD\n\n"
 
-    	    + "⚠️ CRITICAL TABLE NAME WARNING:\n"
-    	    + "The KAI table is: ais.KAI_RECORD_PLANS_AND_DRAWINGS\n"
-    	    + "NOT: KAI_RECORD_PLANS_OR_DRAWINGS\n"
-    	    + "NOT: KAI_RECORD_PLANS_TO_DRAWINGS\n"
-    	    + "NOT: KAI_PLANS_AND_DRAWINGS\n"
-    	    + "Copy it EXACTLY as shown above.\n\n"
+            + "⚠️ CRITICAL TABLE NAME WARNING:\n"
+            + "The KAI table is: ais.KAI_RECORD_PLANS_AND_DRAWINGS\n"
+            + "NOT: KAI_RECORD_PLANS_OR_DRAWINGS\n"
+            + "NOT: KAI_RECORD_PLANS_TO_DRAWINGS\n"
+            + "NOT: KAI_PLANS_AND_DRAWINGS\n"
+            + "Copy it EXACTLY as shown above.\n\n"
 
-    	    + "RULES:\n"
-    	    + "1. Only generate SELECT statements — never INSERT, UPDATE, DELETE, DROP.\n"
-    	    + "2. Always include TOP 50 unless user asks for a count.\n"
-    	    + "3. Start FROM ais.A_GENERAL_INFO g — this is your main table.\n"
-    	    + "4. For location name filter: UPPER(g.LOC_NAME) LIKE '%KEYWORD%' OR UPPER(g.ADDRESS) LIKE '%KEYWORD%'\n"
-    	    + "5. If NO location is mentioned, do NOT add any location filter.\n"
-    	    + "6. To check if a report exists use EXISTS subquery.\n"
-    	    + "7. Return ONLY the raw SQL. No explanation. No markdown. No comments.\n\n"
+            + "CRITICAL FILTERING RULES (LOC_CD vs DEPT_CD):\n"
+            + "- LOC_CD (Location Code): Always an 11 to 15 character alphanumeric code (e.g., UC07300217003, SB04400361000). If the query contains a code like this, filter by g.LOC_CD = 'CODE'.\n"
+            + "- DEPT_CD (Department Code): Always a short alphabetic acronym (e.g., LCSD, AFCD, HD, DSD). Never filter g.DEPT_CD by an 11-digit location code.\n"
+            + "- If the user asks for the department or PSM managing a specific location code, SELECT g.LOC_CD, g.LOC_NAME, g.ADDRESS, g.DEPT_CD, g.DEPT_DESC, g.PSM and filter WHERE g.LOC_CD = 'CODE'.\n\n"
 
-    	    + "EXAMPLES:\n\n"
+            + "RULES:\n"
+            + "1. Only generate SELECT statements — never INSERT, UPDATE, DELETE, DROP.\n"
+            + "2. Always include TOP 50 unless user asks for a count.\n"
+            + "3. Start FROM ais.A_GENERAL_INFO g — this is your main table.\n"
+            + "4. For location name filter: UPPER(g.LOC_NAME) LIKE '%KEYWORD%' OR UPPER(g.ADDRESS) LIKE '%KEYWORD%'\n"
+            + "5. If NO location name is mentioned, do NOT add any location filter.\n"
+            + "6. To check if a report exists use EXISTS subquery.\n"
+            + "7. Return ONLY the raw SQL. No explanation. No markdown. No comments.\n\n"
 
-    	    + "Question: any location code has all 5 reports?\n"
-    	    + "SQL: SELECT TOP 50 g.LOC_CD, g.LOC_NAME, g.ADDRESS "
-    	    +   "FROM ais.A_GENERAL_INFO g "
-    	    +   "WHERE EXISTS (SELECT 1 FROM ais.BSI_GENERAL_INFO b WHERE b.LOC_CD = g.LOC_CD) "
-    	    +   "AND EXISTS (SELECT 1 FROM ais.CS_PLAN c WHERE c.LOC_CD = g.LOC_CD) "
-    	    +   "AND EXISTS (SELECT 1 FROM ais.KAI_RECORD_PLANS_AND_DRAWINGS k WHERE k.LOC_CD = g.LOC_CD) "
-    	    +   "AND EXISTS (SELECT 1 FROM ais.OLD_EMMS e WHERE e.LOC_CD = g.LOC_CD) "
-    	    +   "AND EXISTS (SELECT 1 FROM ais.DSSR_REPORT d WHERE d.LOC_CD = g.LOC_CD) "
-    	    +   "ORDER BY g.LOC_NAME\n\n"
+            + "EXAMPLES:\n\n"
 
-    	    + "Question: which locations in Sha Tin have all 5 reports?\n"
-    	    + "SQL: SELECT TOP 50 g.LOC_CD, g.LOC_NAME, g.ADDRESS "
-    	    +   "FROM ais.A_GENERAL_INFO g "
-    	    +   "WHERE (UPPER(g.LOC_NAME) LIKE '%SHA TIN%' OR UPPER(g.ADDRESS) LIKE '%SHA TIN%') "
-    	    +   "AND EXISTS (SELECT 1 FROM ais.BSI_GENERAL_INFO b WHERE b.LOC_CD = g.LOC_CD) "
-    	    +   "AND EXISTS (SELECT 1 FROM ais.CS_PLAN c WHERE c.LOC_CD = g.LOC_CD) "
-    	    +   "AND EXISTS (SELECT 1 FROM ais.KAI_RECORD_PLANS_AND_DRAWINGS k WHERE k.LOC_CD = g.LOC_CD) "
-    	    +   "AND EXISTS (SELECT 1 FROM ais.OLD_EMMS e WHERE e.LOC_CD = g.LOC_CD) "
-    	    +   "AND EXISTS (SELECT 1 FROM ais.DSSR_REPORT d WHERE d.LOC_CD = g.LOC_CD) "
-    	    +   "ORDER BY g.LOC_NAME\n\n"
+            + "Question: Show department managing UC07300217003\n"
+            + "SQL: SELECT TOP 50 g.LOC_CD, g.LOC_NAME, g.ADDRESS, g.DEPT_CD, g.DEPT_DESC, g.PSM "
+            +   "FROM ais.A_GENERAL_INFO g "
+            +   "WHERE UPPER(g.LOC_CD) = 'UC07300217003'\n\n"
 
-    	    + "Question: how many LCSD locations have BSI report?\n"
-    	    + "SQL: SELECT COUNT(*) AS total "
-    	    +   "FROM ais.A_GENERAL_INFO g "
-    	    +   "WHERE UPPER(LTRIM(RTRIM(g.DEPT_CD))) = 'LCSD' "
-    	    +   "AND EXISTS (SELECT 1 FROM ais.BSI_GENERAL_INFO b WHERE b.LOC_CD = g.LOC_CD)\n\n"
+            + "Question: show managing department of lo wu\n"
+            + "SQL: SELECT TOP 50 g.LOC_CD, g.LOC_NAME, g.ADDRESS, g.DEPT_CD, g.DEPT_DESC, g.PSM "
+            +   "FROM ais.A_GENERAL_INFO g "
+            +   "WHERE (UPPER(g.LOC_NAME) LIKE '%LO WU%' OR UPPER(g.ADDRESS) LIKE '%LO WU%') "
+            +   "ORDER BY g.LOC_NAME\n\n"
 
-    	    + "Question: which monuments have DSSR report?\n"
-    	    + "SQL: SELECT TOP 50 g.LOC_CD, g.LOC_NAME, g.ADDRESS "
-    	    +   "FROM ais.A_GENERAL_INFO g "
-    	    +   "JOIN GIS_DB.sde.T_ASD_COMBINED c ON g.LOC_CD = c.LOC_CD "
-    	    +   "WHERE UPPER(c.DECLR_MONUMT) = 'T' "
-    	    +   "AND EXISTS (SELECT 1 FROM ais.DSSR_REPORT d WHERE d.LOC_CD = g.LOC_CD) "
-    	    +   "ORDER BY g.LOC_NAME\n\n"
+            + "Question: any location code has all 5 reports?\n"
+            + "SQL: SELECT TOP 50 g.LOC_CD, g.LOC_NAME, g.ADDRESS "
+            +   "FROM ais.A_GENERAL_INFO g "
+            +   "WHERE EXISTS (SELECT 1 FROM ais.BSI_GENERAL_INFO b WHERE b.LOC_CD = g.LOC_CD) "
+            +   "AND EXISTS (SELECT 1 FROM ais.CS_PLAN c WHERE c.LOC_CD = g.LOC_CD) "
+            +   "AND EXISTS (SELECT 1 FROM ais.KAI_RECORD_PLANS_AND_DRAWINGS k WHERE k.LOC_CD = g.LOC_CD) "
+            +   "AND EXISTS (SELECT 1 FROM ais.OLD_EMMS e WHERE e.LOC_CD = g.LOC_CD) "
+            +   "AND EXISTS (SELECT 1 FROM ais.DSSR_REPORT d WHERE d.LOC_CD = g.LOC_CD) "
+            +   "ORDER BY g.LOC_NAME\n\n"
 
-    	    + "/nothink";
+            + "Question: how many LCSD locations have BSI report?\n"
+            + "SQL: SELECT COUNT(*) AS total "
+            +   "FROM ais.A_GENERAL_INFO g "
+            +   "WHERE UPPER(LTRIM(RTRIM(g.DEPT_CD))) = 'LCSD' "
+            +   "AND EXISTS (SELECT 1 FROM ais.BSI_GENERAL_INFO b WHERE b.LOC_CD = g.LOC_CD)\n\n"
+
+            + "/nothink";
     
     public OllamaService() {
         this.httpClient = buildHttpClient();
@@ -523,92 +516,99 @@ public class OllamaService {
     // MAIN ENTRY POINT
     // ══════════════════════════════════════════════════════════════
     public AgentResult invoke(String userPrompt, String sessionId) throws IOException {
-        AgentResult result = new AgentResult();
+    	AgentResult result = new AgentResult();
         result.setPrompt(userPrompt);
+        long t0 = System.currentTimeMillis();
 
-        // ── Phase 1: Keyword extraction ───────────────────────────────
-        log.info("🔑 Extracting keywords from prompt...");
-        ExtractedKeywords keywords = extractKeywords(userPrompt);
-
-        if (keywords != null) {
-            log.info("🔑 Keywords: {}", keywords);
-        } else {
-            log.warn("⚠️ Keyword extraction failed");
+        // ── Phase 0: Resolve referential prompts from session memory ──────
+        String resolvedPrompt = resolveReferentialPrompt(userPrompt, sessionId);
+        if (!resolvedPrompt.equals(userPrompt)) {
+            log.info("🔗 Resolved '{}' → '{}'", userPrompt, resolvedPrompt);
+            userPrompt = resolvedPrompt;
+            result.setPrompt(userPrompt);
         }
 
+        // ── Phase 1: Keyword extraction ───────────────────────────────
+        log.info("🔑 Extracting keywords...");
+        ExtractedKeywords keywords = extractKeywords(userPrompt);
+        log.info("⏱️ Phase 1: {}ms", System.currentTimeMillis() - t0);
+
         // ── Phase 2: Query planner ────────────────────────────────────
-        QueryPlanner.Plan plan = planner.analyse(userPrompt, keywords);
+        Plan plan = planner.analyse(userPrompt, keywords);
         log.info("📋 Plan: needsLlm={} steps={} reason={}",
                 plan.needsLlm, plan.steps, plan.reason);
 
-        // ── Phase 3: Fast-path execution ──────────────────────────────
+        // ── Phase 3: Fast-path ────────────────────────────────────────
         if (!plan.needsLlm && !plan.steps.isEmpty()) {
             String answer = executePlan(plan, result, sessionId);
             result.setAnswer(answer);
+            log.info("⏱️ Total: {}ms (fast-path)", System.currentTimeMillis() - t0);
             return result;
         }
 
+        // ── Phase 4: Skip agent loop for SQL-generation candidates ────
+        boolean skipAgentLoop = keywords != null && (
+                keywords.hasIntent("UNKNOWN")
+                || keywords.hasIntent("SQL_QUERY")
+                || keywords.isCompound()          // multi-intent → SQL
+        );
 
-     // ── Phase 4: UNKNOWN or SQL_QUERY → skip agent loop ──────────────
-     boolean skipAgentLoop = keywords != null && (
-             "UNKNOWN".equalsIgnoreCase(keywords.intent) ||
-             "SQL_QUERY".equalsIgnoreCase(keywords.intent)   // ← ADD THIS
-     );
-
-     if (skipAgentLoop) {
-         log.info("⚡ {} intent → skipping agent loop, generating SQL directly",
-                 keywords.intent);
-         try {
-             String sqlResult = generateAndExecuteSql(userPrompt, keywords);
-             String html = formatAsHtml(sqlResult);
-
-             if (!isUselessSqlResult(sqlResult)) {
-                 html = "<p class='answer-summary'>"
-                      + "💡 Answered using a generated database query:"
-                      + "</p>" + html;
-                 result.setAnswer(html);
-                 return result;
-             }
-             log.warn("⚠️ SQL generation produced no result — falling back to agent loop");
-
-         } catch (Exception e) {
-             log.error("SQL generation failed: {} — falling back", e.getMessage());
-         }
-     }
-
-        // ── Phase 5: Agent loop (complex multi-step reasoning only) ───
-        log.info("🤖 Entering agent loop: {}", plan.reason);
-        AgentResult agentResult = runAgentLoop(userPrompt, keywords, result, sessionId);
-
-        // ── Phase 6: SQL fallback if agent loop also failed ───────────
-        if (isEmptyResult(agentResult.getAnswer())) {
-            log.info("🔄 Agent loop produced no result → SQL generation fallback");
+        if (skipAgentLoop) {
+            log.info("⚡ {} → generating SQL directly",
+                    keywords.isCompound() ? "compound " + keywords.getIntents()
+                                          : keywords.primaryIntent());
             try {
                 String sqlResult = generateAndExecuteSql(userPrompt, keywords);
-                String html = formatAsHtml(sqlResult);
-                html = "<p class='answer-summary'>"
-                     + "💡 Answered using a generated database query:"
-                     + "</p>" + html;
-                agentResult.setAnswer(html);
+                if (!isUselessSqlResult(sqlResult)) {
+                    String html = "<p class='answer-summary'>"
+                            + "💡 Answered using a generated database query:"
+                            + "</p>" + formatAsHtml(sqlResult);
+                    result.setAnswer(html);
+                    log.info("⏱️ Total: {}ms (SQL gen)", System.currentTimeMillis() - t0);
+                    return result;
+                }
+                log.warn("⚠️ SQL gen empty → falling back to agent loop");
             } catch (Exception e) {
-                log.error("SQL fallback also failed: {}", e.getMessage());
+                log.error("SQL gen failed: {}", e.getMessage());
             }
         }
 
+        // ── Phase 5: Agent loop (last resort) ─────────────────────────
+        log.info("🤖 Entering agent loop: {}", plan.reason);
+        AgentResult agentResult = runAgentLoop(userPrompt, keywords, result, sessionId);
+
+        // ── Phase 6: Post-agent SQL fallback ──────────────────────────
+        if (isEmptyResult(agentResult.getAnswer())) {
+            log.info("🔄 Agent empty → SQL fallback");
+            try {
+                String sqlResult = generateAndExecuteSql(userPrompt, keywords);
+                if (!isUselessSqlResult(sqlResult)) {
+                    String html = "<p class='answer-summary'>"
+                            + "💡 Answered using a generated database query:"
+                            + "</p>" + formatAsHtml(sqlResult);
+                    agentResult.setAnswer(html);
+                }
+            } catch (Exception e) {
+                log.error("SQL fallback failed: {}", e.getMessage());
+            }
+        }
+
+        log.info("⏱️ Total: {}ms", System.currentTimeMillis() - t0);
         return agentResult;
     }
 
+
     // ── Check if SQL result itself is useless ────────────────────────
     private boolean isUselessSqlResult(String sqlResult) {
-        try {
-            JsonNode node = mapper.readTree(sqlResult);
-            if (node.has("error")) return true;
-            if (node.has("count") && node.path("count").asInt(0) == 0) return false;
-            // Has results = useful
-            return !node.has("results") && !node.has("count");
-        } catch (Exception e) {
+        if (sqlResult == null || sqlResult.trim().isEmpty()) {
             return true;
         }
+        String lower = sqlResult.toLowerCase();
+        // If SQL returned 0 locations or an error, treat as useless so we fall back to the Agent Loop!
+        if (lower.contains("found 0 location") || lower.contains("no matching locations found") || lower.contains("error")) {
+            return true;
+        }
+        return false;
     }
 
     // ── Check if agent result is empty or just "No results found" ────
@@ -957,40 +957,73 @@ public class OllamaService {
     }
 
     // ── Format search results as a list ──────────────────────────────
+    // ── Format search results dynamically (supports LLM SQL columns) ──
     private String formatSearchResults(JsonNode node) {
         int count = node.path("count").asInt(0);
         JsonNode results = node.path("results");
-
         StringBuilder html = new StringBuilder();
-        html.append("<h3 class='data-title'>🔍 Found ")
-                .append(count).append(" location(s)</h3>");
 
-        if (count == 0) {
+        html.append("<h3 class='data-title'>🔍 Found ")
+            .append(count).append(" location(s)</h3>");
+
+        if (count == 0 || !results.isArray() || results.size() == 0) {
             html.append("<p>No matching locations found.</p>");
             return html.toString();
         }
 
         html.append("<table class='data-table'>");
-        html.append("<tr><th>Code</th><th>Name</th><th>Address</th></tr>");
+        html.append("<tr>");
 
-        for (JsonNode item : results) {
-            String code = item.path("LOC_CD").asText("");
-            String name = item.path("LOC_NAME").asText("").trim();
-            String address = item.path("ADDRESS").asText("").trim();
-
-            html.append("<tr>")
-                    .append("<td><code>").append(escapeHtml(code)).append("</code></td>")
-                    .append("<td><strong>").append(escapeHtml(name)).append("</strong></td>")
-                    .append("<td>").append(escapeHtml(address)).append("</td>")
-                    .append("</tr>");
+        // ── 1. DYNAMICALLY DETECT COLUMNS FROM FIRST RESULT OBJECT ──
+        JsonNode firstItem = results.get(0);
+        List<String> columns = new ArrayList<String>();
+        Iterator<String> fieldNames = firstItem.fieldNames();
+        while (fieldNames.hasNext()) {
+            columns.add(fieldNames.next());
         }
 
+        // ── 2. RENDER TABLE HEADERS ──
+        for (String col : columns) {
+            String headerLabel = col;
+            if (col.equalsIgnoreCase("LOC_CD")) headerLabel = "Code";
+            else if (col.equalsIgnoreCase("LOC_NAME")) headerLabel = "Name";
+            else if (col.equalsIgnoreCase("ADDRESS")) headerLabel = "Address";
+            else if (col.equalsIgnoreCase("DEPT_CD")) headerLabel = "Dept Code";
+            else if (col.equalsIgnoreCase("DEPT_DESC")) headerLabel = "Dept Desc";
+            else if (col.equalsIgnoreCase("PSM")) headerLabel = "PSM";
+            else headerLabel = formatLabel(col); // Fallback to your Title Case helper
+
+            html.append("<th>").append(escapeHtml(headerLabel)).append("</th>");
+        }
+        html.append("</tr>");
+
+        // ── 3. RENDER TABLE ROWS DYNAMICALLY ──
+        for (JsonNode item : results) {
+            html.append("<tr>");
+            for (String col : columns) {
+                String val = item.path(col).asText("").trim();
+                
+                html.append("<td>");
+                if (col.equalsIgnoreCase("LOC_CD")) {
+                    html.append("<code>").append(escapeHtml(val)).append("</code>");
+                } else if (col.equalsIgnoreCase("LOC_NAME")) {
+                    html.append("<strong>").append(escapeHtml(val)).append("</strong>");
+                } else {
+                    html.append(escapeHtml(formatValue(val))); // Use your formatting helper
+                }
+                html.append("</td>");
+            }
+            html.append("</tr>");
+        }
         html.append("</table>");
-        html.append("<p class='data-footer'>")
+
+        if (firstItem.has("LOC_CD")) {
+            html.append("<p class='data-footer'>")
                 .append("💡 Tip: Use the code (e.g., '")
-                .append(escapeHtml(results.path(0).path("LOC_CD").asText()))
+                .append(escapeHtml(firstItem.path("LOC_CD").asText()))
                 .append("') to get full details.")
                 .append("</p>");
+        }
 
         return html.toString();
     }
@@ -999,61 +1032,69 @@ public class OllamaService {
     private String formatSingleLocation(JsonNode node) {
         StringBuilder html = new StringBuilder();
 
-        boolean isSlope = node.path("isSlope").asBoolean(false);
+        boolean isSlope    = node.path("isSlope").asBoolean(false);
+        boolean isMonument = node.path("isMonument").asBoolean(false);
+        String  grade      = node.path("historicGrade").asText("");
 
-        // ── Title with appropriate icon ───────────────────────────
         JsonNode general = node.has("general") ? node.path("general") : node;
-        String title = general.path("LOC_NAME").asText("");
-        String code = general.path("LOC_CD").asText("");
+        String title = general.path("LOC_NAME").asText("").trim();
+        String code  = general.path("LOC_CD").asText("").trim();
 
+        // ── Title ─────────────────────────────────────────────────────────
         if (!title.isEmpty()) {
             html.append("<h3 class='data-title'>")
-                    .append(isSlope ? "🏔️ " : "📍 ")
-                    .append(escapeHtml(title.trim()));
+                .append(isSlope ? "🏔️ " : isMonument ? "🏛️ " : "📍 ")
+                .append(escapeHtml(title));
             if (!code.isEmpty()) {
                 html.append(" <span class='data-code'>(")
-                        .append(escapeHtml(code.trim()))
-                        .append(")</span>");
+                    .append(escapeHtml(code)).append(")</span>");
             }
             html.append("</h3>");
         }
 
-        // ── General info table (unchanged) ────────────────────────
+        // ── Heritage badges ───────────────────────────────────────────────
+        if (isMonument || !grade.isEmpty()) {
+            html.append("<div style='margin:8px 0;'>");
+            if (isMonument) {
+                html.append("<span class='report-type-badge' style='background:#c0392b;color:white;'>")
+                    .append("🏛️ Declared Monument</span> ");
+            }
+            if (!grade.isEmpty()) {
+                html.append("<span class='report-type-badge' style='background:#8e44ad;color:white;'>")
+                    .append("Historic Grade ").append(escapeHtml(grade))
+                    .append("</span>");
+            }
+            html.append("</div>");
+        }
+
+        // ── General info table ────────────────────────────────────────────
         html.append("<table class='data-table'>");
         int rowCount = 0;
         Iterator<Map.Entry<String, JsonNode>> fields = general.fields();
         while (fields.hasNext()) {
             Map.Entry<String, JsonNode> entry = fields.next();
             String key = entry.getKey();
+            if ("LOC_NAME".equals(key) || "LOC_CD".equals(key)) continue;
             JsonNode value = entry.getValue();
-            if (key.equals("LOC_NAME") || key.equals("LOC_CD")) {
-                continue;
-            }
-            if (value.isNull()) {
-                continue;
-            }
+            if (value.isNull()) continue;
             String valStr = value.asText().trim();
-            if (valStr.isEmpty()) {
-                continue;
-            }
+            if (valStr.isEmpty()) continue;
 
             html.append("<tr>")
-                    .append("<th>").append(escapeHtml(formatLabel(key))).append("</th>")
-                    .append("<td>").append(escapeHtml(formatValue(valStr))).append("</td>")
-                    .append("</tr>");
+                .append("<th>").append(escapeHtml(formatLabel(key))).append("</th>")
+                .append("<td>").append(escapeHtml(formatValue(valStr))).append("</td>")
+                .append("</tr>");
             rowCount++;
         }
         html.append("</table>");
-        html.append("<p class='data-footer'>")
-                .append("Showing ").append(rowCount).append(" field(s) with data")
-                .append("</p>");
+        html.append("<p class='data-footer'>Showing ")
+            .append(rowCount).append(" field(s) with data</p>");
 
-        // ── SLOPE-only sections ─────────────────────────────────────
+        // ── Reports ───────────────────────────────────────────────────────
         if (isSlope) {
             html.append(formatSlopeReports(node.path("slopeReports")));
             html.append(formatTmcpForms(node.path("tmcpForms")));
-        } // ── NON-SLOPE: standard reports ─────────────────────────────
-        else if (node.has("reports") && node.path("reports").isArray()) {
+        } else if (node.has("reports") && node.path("reports").isArray()) {
             html.append(formatReportLinks(node.path("reports"), code));
         }
 
@@ -1365,49 +1406,47 @@ public class OllamaService {
     // ── Build initial messages — inject /nothink into USER message too ──
     private List<Map<String, Object>> buildInitialMessages(
             String userPrompt,
-            OllamaService.ExtractedKeywords keywords) {
+            ExtractedKeywords keywords) {
 
         List<Map<String, Object>> messages = new ArrayList<Map<String, Object>>();
 
         Map<String, Object> userMsg = new LinkedHashMap<String, Object>();
         userMsg.put("role", "user");
 
-        // ── Build content string ──────────────────────────────────────
         StringBuilder content = new StringBuilder();
         content.append(userPrompt);
 
-        // ── Inject keywords as context for LLM ───────────────────────
         if (keywords != null) {
             content.append("\n\n[Extracted context: ");
-            content.append("intent=").append(keywords.intent);
-            if (keywords.locationName != null)
-                content.append(", location=").append(keywords.locationName);
-            if (keywords.locationCode != null)
-                content.append(", code=").append(keywords.locationCode);
-            if (keywords.modifier != null)
-                content.append(", modifier=").append(keywords.modifier);
-            if (keywords.department != null)
-                content.append(", dept=").append(keywords.department);
-            if (keywords.grade != null)
-                content.append(", grade=").append(keywords.grade);
-            if (keywords.filter != null)
-                content.append(", filter=").append(keywords.filter);
-            if (keywords.reportType != null)
-                content.append(", reportType=").append(keywords.reportType);
-            if (!keywords.rawKeywords.isEmpty())
+            content.append("intent=").append(keywords.getIntents());
+            if (keywords.getLocationName() != null)
+                content.append(", location=").append(keywords.getLocationName());
+            if (keywords.getLocationCode() != null)
+                content.append(", code=").append(keywords.getLocationCode());
+            if (keywords.getModifier() != null)
+                content.append(", modifier=").append(keywords.getModifier());
+            if (keywords.getDepartment() != null)
+                content.append(", dept=").append(keywords.getDepartment());
+            if (keywords.getGrade() != null)
+                content.append(", grade=").append(keywords.getGrade());
+            if (keywords.getFilter() != null)
+                content.append(", filter=").append(keywords.getFilter());
+            if (keywords.getReportType() != null)
+                content.append(", reportType=").append(keywords.getReportType());
+            if (keywords.getRawKeywords() != null
+                    && !keywords.getRawKeywords().isEmpty())
                 content.append(", keywords=")
-                       .append(String.join(", ", keywords.rawKeywords));
+                       .append(String.join(", ", keywords.getRawKeywords()));
             content.append(". Use these to guide your tool selection.]");
         }
 
         content.append(" /nothink");
         userMsg.put("content", content.toString());
         messages.add(userMsg);
-
         return messages;
     }
 
-    // ── Backward compat — no keywords ────────────────────────────────
+    // ── Backward compat ───────────────────────────────────────────────
     private List<Map<String, Object>> buildInitialMessages(String userPrompt) {
         return buildInitialMessages(userPrompt, null);
     }
@@ -1471,6 +1510,25 @@ public class OllamaService {
             return toolCalls;
         }
 
+        public java.util.List<String> getToolNames() {
+            java.util.List<String> names = new java.util.ArrayList<>();
+            for (ToolCallRecord call : toolCalls) {
+                names.add(call.getToolName());
+            }
+            return names;
+        }
+
+        public String getToolSummary() {
+            if (toolCalls.isEmpty()) return "";
+            StringBuilder sb = new StringBuilder();
+            for (ToolCallRecord call : toolCalls) {
+                sb.append("Tool: ").append(call.getToolName())
+                  .append("\nOutput: ").append(call.getOutput())
+                  .append("\n---\n");
+            }
+            return sb.toString();
+        }
+
         public static class ToolCallRecord {
 
             private final String name;
@@ -1485,15 +1543,15 @@ public class OllamaService {
                 this.result = result;
             }
 
-            public String name() {
+            public String getToolName() {
                 return name;
             }
 
-            public Map<String, Object> args() {
+            public Map<String, Object> getArgs() {
                 return args;
             }
 
-            public String result() {
+            public String getOutput() {
                 return result;
             }
         }
@@ -1656,66 +1714,78 @@ public class OllamaService {
 
     // ── Format declared monuments ───────────────────────────────────
     private String formatDeclaredMonuments(JsonNode node) {
-        String filter = node.path("filter").asText("T").trim();
-        String locationFilter = node.path("locationFilter").asText("").trim(); // ← NEW
         int count = node.path("count").asInt(0);
+        boolean enriched = node.path("enriched").asBoolean(false);
         JsonNode results = node.path("results");
 
         StringBuilder html = new StringBuilder();
 
-        String filterLabel = "T".equals(filter) ? "Declared Monuments"
-                : "F".equals(filter) ? "Non-Monument Locations"
-                : "All Locations (Monument Status)";
-
-        // ── Show location in title if filtered ────────────────────────
-        if (!locationFilter.isEmpty()) {
-            filterLabel += " in " + locationFilter;   // ← "Declared Monuments in Sha Tin"
-        }
-
-        html.append("<h3 class='data-title'>🏛️ ")
-                .append(escapeHtml(filterLabel))
-                .append("</h3>");
-
-        html.append("<p class='answer-summary'>")
-                .append("Found <strong>").append(count).append("</strong> location(s)")
-                .append(count >= 50 ? " (showing first 50)" : "")
-                .append(".</p>");
+        html.append("<h3 class='data-title'>🏛️ Declared Monuments</h3>");
+        html.append("<p>Found ").append(count).append(" location(s)");
+        if (count > 50) html.append(" (showing first 50)");
+        html.append(".</p>");
 
         if (count == 0) {
             html.append("<p>No matching locations found.</p>");
             return html.toString();
         }
 
-        html.append("<details class='psm-locations-details' open>");
-        html.append("<summary class='psm-locations-summary'>")
-                .append("📂 Show ").append(count).append(" location(s)")
-                .append("</summary>");
-
-        html.append("<div class='psm-locations-body'>");
         html.append("<table class='data-table'>");
-        html.append("<tr><th>Code</th><th>Name</th><th>Address</th>")
-                .append("<th>Monument</th></tr>");
 
+        // ── Header ────────────────────────────────────────────────────────
+        html.append("<tr>")
+            .append("<th>Code</th>")
+            .append("<th>Name</th>")
+            .append("<th>Address</th>")
+            .append("<th>Monument</th>");
+        if (enriched) {
+            html.append("<th>Historic Grade</th>");
+        }
+        html.append("</tr>");
+
+        // ── Rows ──────────────────────────────────────────────────────────
+        int shown = 0;
         for (JsonNode item : results) {
-            String monumt = item.path("DECLR_MONUMT").asText("").trim();
-            String badge = "T".equalsIgnoreCase(monumt) ? "✅ Yes" : "❌ No";
+            if (shown >= 50) break;
+
+            String code    = item.path("LOC_CD").asText("");
+            String name    = item.path("LOC_NAME").asText("").trim();
+            String address = item.path("ADDRESS").asText("").trim();
+            String monFlag = item.path("DECLR_MONUMT").asText("");
+            String grade   = item.path("GRD_HIST_BLDG").asText("N/A");
+
+            String monDisplay = "T".equals(monFlag) ? "✅ Yes"
+                              : "F".equals(monFlag) ? "❌ No" : monFlag;
+
+            String gradeDisplay;
+            if ("N/A".equals(grade) || grade.isEmpty()) {
+                gradeDisplay = "<span style='color:#999;'>—</span>";
+            } else {
+                gradeDisplay = "<span class='report-type-badge'>Grade "
+                        + escapeHtml(grade) + "</span>";
+            }
 
             html.append("<tr>")
-                    .append("<td><code>")
-                    .append(escapeHtml(item.path("LOC_CD").asText("")))
-                    .append("</code></td>")
-                    .append("<td><strong>")
-                    .append(escapeHtml(item.path("LOC_NAME").asText("").trim()))
-                    .append("</strong></td>")
-                    .append("<td>")
-                    .append(escapeHtml(item.path("ADDRESS").asText("").trim()))
-                    .append("</td>")
-                    .append("<td>").append(badge).append("</td>")
-                    .append("</tr>");
+                .append("<td><code>").append(escapeHtml(code)).append("</code></td>")
+                .append("<td><strong>").append(escapeHtml(name)).append("</strong></td>")
+                .append("<td>").append(escapeHtml(address)).append("</td>")
+                .append("<td>").append(monDisplay).append("</td>");
+
+            if (enriched) {
+                html.append("<td>").append(gradeDisplay).append("</td>");
+            }
+
+            html.append("</tr>");
+            shown++;
         }
+
         html.append("</table>");
-        html.append("</div>");
-        html.append("</details>");
+
+        if (count > 50) {
+            html.append("<p class='data-footer'>")
+                .append("Showing 50 of ").append(count).append(" results.")
+                .append("</p>");
+        }
 
         return html.toString();
     }
@@ -1944,7 +2014,7 @@ public class OllamaService {
     // ── Build a minimal tool list for the agent loop ─────────────────
     private List<Map<String, Object>> getRelevantTools(
             String userPrompt,
-            OllamaService.ExtractedKeywords kw) {
+            ExtractedKeywords kw) {
 
         String p = userPrompt.toUpperCase();
         List<Map<String, Object>> all = mcpClient.listTools();
@@ -1980,42 +2050,46 @@ public class OllamaService {
 
             // ── Boost from LLM keywords (more accurate) ───────────────
             if (kw != null) {
-                switch (kw.intent) {
-                    case "MONUMENT":
-                        include |= "search_declared_monument".equals(name);
-                        break;
-                    case "HISTORIC":
-                        include |= "search_historic_building".equals(name);
-                        break;
-                    case "DEPARTMENT":
-                        include |= "locations_by_dept".equals(name);
-                        break;
-                    case "PSM":
-                        include |= "list_psms".equals(name)
-                                || "locations_by_psm".equals(name);
-                        break;
-                    case "REPORT":
-                        include |= "check_reports".equals(name);
-                        break;
-                    case "CODE_HISTORY":
-                        include |= "search_loc_cd_history".equals(name);
-                        break;
-                    default:
-                        break;
+            	 // ── Compound or unknown → include all tools ───────────────
+                if (kw.isCompound() || kw.hasIntent("UNKNOWN")) {
+                    include = true;
+                } else {
+                    String primary = kw.primaryIntent();
+                    switch (primary) {
+	                    case "MONUMENT":
+	                        include |= "search_declared_monument".equals(name);
+	                        break;
+	                    case "HISTORIC":
+	                        include |= "search_historic_building".equals(name);
+	                        break;
+	                    case "DEPARTMENT":
+	                        include |= "locations_by_dept".equals(name);
+	                        break;
+	                    case "PSM":
+	                        include |= "list_psms".equals(name)
+	                                || "locations_by_psm".equals(name);
+	                        break;
+	                    case "REPORT":
+	                        include |= "check_reports".equals(name);
+	                        break;
+	                    case "CODE_HISTORY":
+	                        include |= "search_loc_cd_history".equals(name);
+	                        break;
+	                    default:
+	                        break;
+	                }
                 }
-            }
 
-            if (include) {
-                Map<String, Object> clean = new LinkedHashMap<String, Object>();
-                clean.put("type", tool.get("type"));
-                clean.put("function", tool.get("function"));
-                filtered.add(clean);
-            }
+	            if (include) {
+	                Map<String, Object> clean = new LinkedHashMap<String, Object>();
+	                clean.put("type", tool.get("type"));
+	                clean.put("function", tool.get("function"));
+	                filtered.add(clean);
+	            }
+	        }
         }
-
         return filtered;
     }
-
     // ── Keep old single-param signature for backward compatibility ──
     private List<Map<String, Object>> getRelevantTools(String userPrompt) {
         return getRelevantTools(userPrompt, null);
@@ -2026,7 +2100,7 @@ public class OllamaService {
     // Runs all steps in order. Steps can depend on previous results
     // via codesSource markers.
     // ══════════════════════════════════════════════════════════════
-    private String executePlan(QueryPlanner.Plan plan,
+    private String executePlan(Plan plan,
             AgentResult result,
             String sessionId) throws IOException {
 
@@ -2034,7 +2108,7 @@ public class OllamaService {
         List<String> lastCodes = new ArrayList<String>();
         String lastToolResult = null;
 
-        for (QueryPlanner.Intent intent : plan.steps) {
+        for (Intent intent : plan.steps) {
             log.info("▶ Executing intent: {}", intent);
 
             // ══════════════════════════════════════════════════════════
@@ -2060,6 +2134,7 @@ public class OllamaService {
             // STEP 3: Call tool
             // ══════════════════════════════════════════════════════════
             log.info("🔧 Tool: {} args: {}", toolName, args);
+            String previousToolResult = lastToolResult;  // save before overwrite
             String r = mcpClient.callTool(toolName, args);
             result.addToolCall(toolName, args, r);
             lastToolResult = r;
@@ -2070,22 +2145,46 @@ public class OllamaService {
             r = applyModifier(intent, r, result);
 
             // ══════════════════════════════════════════════════════════
-            // STEP 5: Update state
+            // STEP 4.5: Cross-filter with previous step result
+            // Activated by crossFilterWith=previous in intent params
+            // Works for any compound intent — not hardcoded per pair
             // ══════════════════════════════════════════════════════════
-            lastCodes = extractCodesFromResult(r);
-            if (!lastCodes.isEmpty()) {
-                LAST_RESULTS.put(sessionId, lastCodes);
+            if ("true".equals(intent.params.get("enrich"))
+                    && previousToolResult != null) {
+                log.info("🔗 Enriching previous results with '{}' data", intent.type);
+                String gradeFilter = intent.params.get("grade"); // e.g., "1", "ALL", "GRADED"
+                r = enrichWithHistoricGrade(previousToolResult, r, gradeFilter);
             }
 
             // ══════════════════════════════════════════════════════════
-            // STEP 6: Render HTML
+            // STEP 5: Update state
             // ══════════════════════════════════════════════════════════
-            html.append(formatAsHtml(r));
+            lastCodes = extractCodesFromResult(r);
+
+            // Also extract CURRENT_LOC_CD from history results
+            if (lastCodes.isEmpty() && Intent.CODE_HISTORY.equals(intent.type)) {
+                lastCodes = extractCurrentCodesFromHistory(r);
+                log.info("🔗 Extracted {} current code(s) from history result", lastCodes.size());
+            }
+
+            if (!lastCodes.isEmpty()) {
+                LAST_RESULTS.put(sessionId, lastCodes);
+                log.info("💾 Saved {} codes to session memory", lastCodes.size());
+            }
+
+            // ── STEP 6: Render HTML ───────────────────────────────────────────────
+            boolean isEnrichStep = "true".equals(intent.params.get("enrich"));
+
+            if (isEnrichStep) {
+                // Replace previous HTML with enriched result
+                html.setLength(0);
+                html.append(formatAsHtml(r));
+            } else {
+                html.append(formatAsHtml(r));
+            }
 
             // ══════════════════════════════════════════════════════════
             // STEP 7: Post-step chain actions
-            // Runs after every intent — each chain action decides
-            // whether it applies based on intent params.
             // ══════════════════════════════════════════════════════════
             html.append(runPostStepChains(intent, r, lastCodes, result, sessionId));
         }
@@ -2137,19 +2236,58 @@ public class OllamaService {
     }
 
     // ── Cross-filter: keep only results that appear in reference set ──
-    private String crossFilter(String previousResult,
-            List<String> referenceCodes,
-            String filterField,
-            String nameSearchResult) {
-        // For now, just show both results side by side
-        // Full cross-filter would require DB join — show name results
-        // with note about which have the property
-        return formatAsHtml(nameSearchResult);
+    private String crossFilter(String firstResult,
+            String secondResult) {
+
+        try {
+            JsonNode firstNode = mapper.readTree(firstResult);
+            JsonNode secondNode = mapper.readTree(secondResult);
+
+            JsonNode firstArr = firstNode.path("results");
+            JsonNode secondArr = secondNode.path("results");
+
+            if (!firstArr.isArray() || !secondArr.isArray()) {
+                return secondResult;
+            }
+
+            // Build LOC_CD set from first result
+            Set<String> firstCodes = new LinkedHashSet<String>();
+            for (JsonNode item : firstArr) {
+                String cd = item.path("LOC_CD").asText("").trim().toUpperCase();
+                if (!cd.isEmpty()) firstCodes.add(cd);
+            }
+
+            List<JsonNode> filtered = new ArrayList<JsonNode>();
+            for (JsonNode item : secondArr) {
+                String cd = item.path("LOC_CD").asText("").trim().toUpperCase();
+                if (firstCodes.contains(cd)) {
+                    filtered.add(item);
+                }
+            }
+
+            Map<String, Object> response = new LinkedHashMap<String, Object>();
+            response.put("count", filtered.size());
+            response.put("results", filtered);
+
+            // preserve useful flags from second result
+            if (secondNode.has("grade")) {
+                response.put("grade", secondNode.path("grade").asText(""));
+            }
+            if (firstNode.has("filter")) {
+                response.put("filter", firstNode.path("filter").asText(""));
+            }
+
+            return mapper.writeValueAsString(response);
+
+        } catch (Exception e) {
+            log.error("crossFilter error: {}", e.getMessage());
+            return secondResult;
+        }
     }
 
     private AgentResult runAgentLoop(
             String userPrompt,
-            OllamaService.ExtractedKeywords keywords, // ← ADD THIS
+            ExtractedKeywords keywords, // ← ADD THIS
             AgentResult result,
             String sessionId) throws IOException {
 
@@ -2162,7 +2300,7 @@ public class OllamaService {
         List<String> reasoningSteps = new ArrayList<String>();
         int maxIterations = 5;
         
-        if (keywords != null && "UNKNOWN".equals(keywords.intent)) {
+        if (keywords != null && keywords.hasIntent("UNKNOWN")) {
             maxIterations = 2;
             log.info("⚠️ UNKNOWN intent — limiting agent loop to {} iterations",
                     maxIterations);
@@ -2614,6 +2752,31 @@ public class OllamaService {
      * fails (caller should fallback gracefully).
      */
     public ExtractedKeywords extractKeywords(String userPrompt) {
+        // Check if this is a verifier retry loop
+        boolean isRetry = userPrompt.contains("[Previous answer was flagged");
+
+        // Cache check (only if NOT a retry)
+        String cacheKey = userPrompt.trim().toLowerCase();
+        if (!isRetry) {
+            ExtractedKeywords cached = kwCache.get(cacheKey);
+            if (cached != null) {
+                log.info("⚡ Keyword cache hit");
+                return cached;
+            }
+        } else {
+            log.info("⚠️ Verifier retry detected — bypassing keyword cache");
+        }
+
+        // Call LLM
+        ExtractedKeywords result = extractKeywordsFromLlm(userPrompt);
+        if (result != null && !isRetry) {
+            kwCache.put(cacheKey, result);
+        }
+        return result;
+    }
+
+    // ── PRIVATE: actual LLM call ──────────────────────────────────
+    private ExtractedKeywords extractKeywordsFromLlm(String userPrompt) {
         try {
             List<Map<String, Object>> messages = new ArrayList<Map<String, Object>>();
 
@@ -2622,9 +2785,7 @@ public class OllamaService {
             userMsg.put("content", "Extract keywords from: " + userPrompt + " /nothink");
             messages.add(userMsg);
 
-            // ── Build request manually (no tools, minimal ctx) ────────
             List<Map<String, Object>> fullMessages = new ArrayList<Map<String, Object>>();
-
             Map<String, Object> sysMsg = new LinkedHashMap<String, Object>();
             sysMsg.put("role", "system");
             sysMsg.put("content", KEYWORD_EXTRACT_PROMPT);
@@ -2636,7 +2797,7 @@ public class OllamaService {
             body.put("messages", fullMessages);
             body.put("stream", false);
             body.put("temperature", 0.0);
-            body.put("num_ctx", 1024);   // small ctx — just extraction
+            body.put("num_ctx", 1024);
             body.put("think", false);
 
             String requestBody = mapper.writeValueAsString(body);
@@ -2661,49 +2822,63 @@ public class OllamaService {
 
                 JsonNode root = mapper.readTree(responseBody);
                 String content = root.path("message").path("content").asText("").trim();
-
-                // ── Strip think tags / markdown fences ────────────────
                 content = stripThinkingTags(content);
                 content = stripMarkdownFences(content);
 
                 log.info("🔑 Extracted keywords JSON: {}", content);
 
-                // ── Parse into ExtractedKeywords ──────────────────────
                 JsonNode kw = mapper.readTree(content);
                 ExtractedKeywords result = new ExtractedKeywords();
-                result.intent = kw.path("intent").asText("UNKNOWN");
-                result.locationCode = nullIfEmpty(kw.path("locationCode").asText(""));
-                result.locationName = nullIfEmpty(kw.path("locationName").asText(""));
-                result.reportType = nullIfEmpty(kw.path("reportType").asText(""));
-                result.department = nullIfEmpty(kw.path("department").asText(""));
-                result.psm = nullIfEmpty(kw.path("psm").asText(""));
-                result.grade = nullIfEmpty(kw.path("grade").asText(""));
-                result.filter = nullIfEmpty(kw.path("filter").asText(""));
-                result.modifier = nullIfEmpty(kw.path("modifier").asText(""));
 
-                // ── Raw keywords array ────────────────────────────────
-                JsonNode rawKw = kw.path("rawKeywords");
-                if (rawKw.isArray()) {
-                    for (JsonNode kNode : rawKw) {
-                        result.rawKeywords.add(kNode.asText());
+                List<String> intentsList = new ArrayList<String>();
+
+                JsonNode intentsNode = kw.path("intents");
+                if (intentsNode.isArray()) {
+                    for (JsonNode i : intentsNode) {
+                        String val = i.asText("").trim().toUpperCase();
+                        if (!val.isEmpty()) intentsList.add(val);
                     }
+                } else if (intentsNode.isTextual()) {
+                    intentsList.add(intentsNode.asText("UNKNOWN").trim().toUpperCase());
                 }
 
-                log.info("✅ Keywords: intent={} location={} modifier={} dept={} grade={} filter={}",
-                        result.intent, result.locationName, result.modifier,
-                        result.department, result.grade, result.filter);
+                if (intentsList.isEmpty()) {
+                    String single = kw.path("intent").asText("UNKNOWN").trim().toUpperCase();
+                    intentsList.add(single);
+                }
+
+                result.setIntents(intentsList);
+                result.setLocationCode(nullIfEmpty(kw.path("locationCode").asText("")));
+                result.setLocationName(nullIfEmpty(kw.path("locationName").asText("")));
+                result.setReportType(nullIfEmpty(kw.path("reportType").asText("")));
+                result.setDepartment(nullIfEmpty(kw.path("department").asText("")));
+                result.setPsm(nullIfEmpty(kw.path("psm").asText("")));
+                result.setGrade(nullIfEmpty(kw.path("grade").asText("")));
+                result.setFilter(nullIfEmpty(kw.path("filter").asText("")));
+                result.setModifier(nullIfEmpty(kw.path("modifier").asText("")));
+                
+                result.setGrade(sanitizeGrade(result.getGrade()));
+                
+                List<String> rawList = new ArrayList<String>();
+                JsonNode rawKw = kw.path("rawKeywords");
+                if (rawKw.isArray()) {
+                    for (JsonNode kNode : rawKw) rawList.add(kNode.asText());
+                }
+                result.setRawKeywords(rawList);
+
+                log.info("✅ Keywords: intents={} location={} modifier={} dept={} grade={} filter={}",
+                        result.getIntents(), result.getLocationName(), result.getModifier(),
+                        result.getDepartment(), result.getGrade(), result.getFilter());
 
                 return result;
 
             } finally {
-                if (httpResp != null) {
-                    httpResp.close();
-                }
+                if (httpResp != null) httpResp.close();
             }
 
         } catch (Exception e) {
             log.error("❌ Keyword extraction failed: {}", e.getMessage());
-            return null;  // caller handles null gracefully
+            return null;
         }
     }
 
@@ -2730,87 +2905,83 @@ public class OllamaService {
      * the intent cannot proceed (e.g. no codes for report check).
      */
     private Map<String, Object> buildArgs(
-            QueryPlanner.Intent intent,
+            Intent intent,
             String lastToolResult,
             List<String> lastCodes,
             String sessionId) {
 
         Map<String, Object> args = new LinkedHashMap<String, Object>();
 
-        // ── Universal: inject location into args for DB-side filtering ──
-        String location = intent.params.get("locationFilter");
-
         switch (intent.type) {
 
-            // ── LOCATION_CODE ─────────────────────────────────────────
-            case LOCATION_CODE: {
+            case Intent.LOCATION_CODE: {
                 String codesSource = intent.params.get("codesSource");
 
                 if ("history".equals(codesSource)) {
-                    // Handled separately — multiple codes from history
                     args.put("_multiSource", "history");
                     args.put("_codes", extractCurrentCodesFromHistory(lastToolResult));
 
-                } else if ("psm_first".equals(codesSource)) {
+                } else if ("psm_first".equals(codesSource)
+                        || "previous_first".equals(codesSource)) {
+                    // Pick first code from previous tool result
                     String firstCode = extractFirstCode(lastToolResult);
                     if (firstCode == null) {
+                        log.warn("⚠️ codesSource=psm_first but no code in previous result");
                         return null;
                     }
                     args.put("locCd", firstCode);
 
                 } else {
-                    String locCd = intent.params.get("locCd");
+                    // Direct code from params
+                    String locCd  = intent.params.get("locCd");
                     String locCds = intent.params.get("locCds");
-                    if (locCd != null) {
-                        args.put("locCd", locCd);
-                    } else if (locCds != null) {
-                        args.put("_multiCodes", locCds);
-                    }
+                    if (locCd  != null) args.put("locCd",      locCd);
+                    if (locCds != null) args.put("_multiCodes", locCds);
                 }
                 break;
             }
 
-            // ── NAME_SEARCH ───────────────────────────────────────────
-            case NAME_SEARCH: {
+            case Intent.NAME_SEARCH: {
                 String locName = intent.params.get("locName");
-                args.put("locName", locName);
-                if (location != null) {
-                    args.put("location", location); // DB filter
-
-                                }break;
-            }
-
-            // ── PSM_LIST ──────────────────────────────────────────────
-            case PSM_LIST: {
-                // No args needed
+                if (locName != null) args.put("locName", locName);
+                String location = intent.params.get("locationFilter");
+                if (location != null) args.put("location", location);
                 break;
             }
 
-            // ── PSM_LOCATIONS ─────────────────────────────────────────
-            case PSM_LOCATIONS: {
-                args.put("psm", intent.params.get("psm"));
-                if (location != null) {
-                    args.put("location", location); // DB filter
-
-                                }break;
-            }
-
-            // ── CODE_HISTORY ──────────────────────────────────────────
-            case CODE_HISTORY: {
-                if (intent.params.containsKey("formerLocCd")) {
-                    args.put("formerLocCd", intent.params.get("formerLocCd"));
-                }
-                if (intent.params.containsKey("currentLocCd")) {
-                    args.put("currentLocCd", intent.params.get("currentLocCd"));
-                }
+            case Intent.PSM_LIST: {
+                // No args needed — lists all PSMs
                 break;
             }
 
-            // ── CHECK_REPORTS ─────────────────────────────────────────
-            case CHECK_REPORTS: {
-                String reportType = intent.params.get("reportType");
+            case Intent.PSM_LOCATIONS: {
+                String psm = intent.params.get("psm");
+                if (psm != null) args.put("psm", psm);
+                String location = intent.params.get("locationFilter");
+                if (location != null) args.put("location", location);
+                break;
+            }
+
+            case Intent.CODE_HISTORY: {
+                // ── Primary lookup keys ───────────────────────────────────
+                String locCd       = intent.params.get("locCd");
+                String formerLocCd = intent.params.get("formerLocCd");
+                String currentLocCd= intent.params.get("currentLocCd");
+
+                if (locCd != null) {
+                    // Search by either former or current — DB handles both
+                    args.put("formerLocCd",  locCd);
+                    args.put("currentLocCd", locCd);
+                }
+                if (formerLocCd  != null) args.put("formerLocCd",  formerLocCd);
+                if (currentLocCd != null) args.put("currentLocCd", currentLocCd);
+                break;
+            }
+
+            case Intent.CHECK_REPORTS: {
+                String reportType  = intent.params.get("reportType");
                 String codesSource = intent.params.get("codesSource");
-                String inlineCds = intent.params.get("locCds");
+                String inlineCds   = intent.params.get("locCds");
 
                 List<String> codesToCheck;
                 if (codesSource != null && !lastCodes.isEmpty()) {
@@ -2823,42 +2994,35 @@ public class OllamaService {
                     codesToCheck = getLastResults(sessionId);
                 }
 
-                if (codesToCheck.isEmpty()) {
-                    return null; // Signal: skip
-                }
-                args.put("reportType", reportType);
+                if (codesToCheck.isEmpty()) return null;
+
+                if (reportType != null) args.put("reportType", reportType);
                 args.put("locCds", codesToCheck);
-                if (location != null) {
-                    args.put("location", location); // DB filter
-
-                                }break;
+                break;
             }
 
-            // ── DECLARED_MONUMENT ─────────────────────────────────────
-            case DECLARED_MONUMENT: {
-                args.put("filter", intent.params.getOrDefault("filter", "T"));
-                if (location != null) {
-                    args.put("location", location); // DB filter
-
-                                }break;
+            case Intent.DECLARED_MONUMENT: {
+                String filter = intent.params.getOrDefault("filter", "T");
+                args.put("filter", filter);
+                String location = intent.params.get("locationFilter");
+                if (location != null) args.put("location", location);
+                break;
             }
 
-            // ── HISTORIC_BUILDING ─────────────────────────────────────
-            case HISTORIC_BUILDING: {
-                args.put("grade", intent.params.getOrDefault("grade", "ALL"));
-                if (location != null) {
-                    args.put("location", location); // DB filter
-
-                                }break;
+            case Intent.HISTORIC_BUILDING: {
+                String grade = intent.params.getOrDefault("grade", "ALL");
+                args.put("grade", grade);
+                String location = intent.params.get("locationFilter");
+                if (location != null) args.put("location", location);
+                break;
             }
 
-            // ── DEPARTMENT_LOCATIONS ───────────────────────────────────
-            case DEPARTMENT_LOCATIONS: {
-                args.put("deptCd", intent.params.get("deptCd"));
-                if (location != null) {
-                    args.put("location", location); // DB filter
-
-                                }break;
+            case Intent.DEPARTMENT_LOCATIONS: {
+                String deptCd = intent.params.get("deptCd");
+                if (deptCd != null) args.put("deptCd", deptCd);
+                String location = intent.params.get("locationFilter");
+                if (location != null) args.put("location", location);
+                break;
             }
 
             default:
@@ -2873,30 +3037,8 @@ public class OllamaService {
      * Maps IntentType → MCP tool name. Single source of truth for all tool name
      * bindings.
      */
-    private String resolveToolName(QueryPlanner.IntentType type) {
-        switch (type) {
-            case LOCATION_CODE:
-                return "hardcode_query";
-            case NAME_SEARCH:
-                return "search_by_name";
-            case PSM_LIST:
-                return "list_psms";
-            case PSM_LOCATIONS:
-                return "locations_by_psm";
-            case CODE_HISTORY:
-                return "search_loc_cd_history";
-            case CHECK_REPORTS:
-                return "check_reports";
-            case DECLARED_MONUMENT:
-                return "search_declared_monument";
-            case HISTORIC_BUILDING:
-                return "search_historic_building";
-            case DEPARTMENT_LOCATIONS:
-                return "locations_by_dept";
-            default:
-                log.warn("⚠️ No tool mapped for intent type: {}", type);
-                return null;
-        }
+    private String resolveToolName(String type) {
+    	return Intent.resolveToolName(type);
     }
 
     /**
@@ -2905,7 +3047,7 @@ public class OllamaService {
      * location with largest BLDG_COMPLETION_YEAR FIRST → take first result only
      * COUNT → return count summary only No modifier → return result unchanged
      */
-    private String applyModifier(QueryPlanner.Intent intent,
+    private String applyModifier(Intent intent,
             String toolResult,
             AgentResult result) throws IOException {
 
@@ -3071,29 +3213,29 @@ public class OllamaService {
             // ── Only use locationName if explicitly extracted ──────────
             // Do NOT fall back to raw keywords for location
             // Raw keywords like "all 5 reports" are NOT locations
-            if (keywords.locationName != null && !keywords.locationName.isEmpty()) {
-                question.append("\n- Location filter: ").append(keywords.locationName);
+            if (keywords.getLocationName() != null && !keywords.getLocationName().isEmpty()) {
+                question.append("\n- Location filter: ").append(keywords.getLocationName());
             }
 
-            if (keywords.department != null)
-                question.append("\n- Department: ").append(keywords.department);
-            if (keywords.reportType != null)
-                question.append("\n- Report types mentioned: ").append(keywords.reportType);
-            if (keywords.modifier != null)
-                question.append("\n- Modifier: ").append(keywords.modifier);
-            if (keywords.grade != null)
-                question.append("\n- Grade: ").append(keywords.grade);
-            if (keywords.filter != null)
-                question.append("\n- Monument filter: ").append(keywords.filter);
-            if (!keywords.rawKeywords.isEmpty())
+            if (keywords.getDepartment() != null)
+                question.append("\n- Department: ").append(keywords.getDepartment());
+            if (keywords.getReportType() != null)
+                question.append("\n- Report types mentioned: ").append(keywords.getReportType());
+            if (keywords.getModifier() != null)
+                question.append("\n- Modifier: ").append(keywords.getModifier());
+            if (keywords.getGrade() != null)
+                question.append("\n- Grade: ").append(keywords.getGrade());
+            if (keywords.getFilter() != null)
+                question.append("\n- Monument filter: ").append(keywords.getFilter());
+            if (!keywords.getRawKeywords().isEmpty())
                 question.append("\n- Raw keywords: ")
-                        .append(String.join(", ", keywords.rawKeywords));
+                        .append(String.join(", ", keywords.getRawKeywords()));
 
             // ── If no context clues at all, say so explicitly ──────────
-            if (keywords.locationName == null
-                    && keywords.department == null
-                    && keywords.reportType == null
-                    && keywords.modifier == null) {
+            if (keywords.getLocationName() == null
+                    && keywords.getDepartment() == null
+                    && keywords.getReportType() == null
+                    && keywords.getModifier() == null) {
                 question.append("\n- No location filter — search across ALL locations");
             }
         }
@@ -3198,7 +3340,7 @@ public class OllamaService {
      * No changes needed to executePlan itself.
      */
     private String runPostStepChains(
-            QueryPlanner.Intent intent,
+            Intent intent,
             String toolResult,
             List<String> lastCodes,
             AgentResult result,
@@ -3213,42 +3355,71 @@ public class OllamaService {
         // ── Chain 1: CODE_HISTORY + autoFetchCurrent ──────────────────
         // Trigger: CODE_HISTORY intent with autoFetchCurrent=true
         // Action:  fetch full details for each current code found
-        if (intent.type == QueryPlanner.IntentType.CODE_HISTORY
-                && "true".equals(intent.params.get("autoFetchCurrent"))) {
+        if (intent.type == Intent.CODE_HISTORY) {
 
-            // ── History results use CURRENT_LOC_CD not LOC_CD ─────────────
-            // Must use history-specific extractor, not generic lastCodes
+            String searchedCode = intent.params.get("locCd");
+            if (searchedCode == null || searchedCode.trim().isEmpty()) {
+                searchedCode = intent.params.get("formerLocCd");
+            }
+            if (searchedCode == null || searchedCode.trim().isEmpty()) {
+                searchedCode = intent.params.get("currentLocCd");
+            }
+
+            final String searched = searchedCode != null
+                    ? searchedCode.trim().toUpperCase()
+                    : null;
+
             List<String> currentCodes = extractCurrentCodesFromHistory(toolResult);
 
-            if (!currentCodes.isEmpty()) {
-                log.info("🔗 Chain 1: CODE_HISTORY → fetching details for: {}",
-                        currentCodes);
+            log.info("🔗 CODE_HISTORY searched={}, currentCodes={}", searched, currentCodes);
+
+            // ── Check if searched code is NOT in currentCodes ──────────
+            // If not current → it is former → auto-trigger hardcode_query
+            boolean searchedIsCurrent = false;
+            if (searched != null) {
+                for (String c : currentCodes) {
+                    if (c != null && searched.equalsIgnoreCase(c.trim())) {
+                        searchedIsCurrent = true;
+                        break;
+                    }
+                }
+            }
+
+            boolean shouldAutoFetch = searched != null
+                    && !currentCodes.isEmpty()
+                    && !searchedIsCurrent;
+
+            log.info("🔗 searchedIsCurrent={}, shouldAutoFetch={}", 
+                    searchedIsCurrent, shouldAutoFetch);
+
+            if (shouldAutoFetch) {
+                log.info("🔗 '{}' is former code → auto-trigger hardcode_query for {}",
+                        searched, currentCodes);
+
+                html.append("<p class='answer-summary' style='color:#f0a500;'>")
+                    .append("🔄 <strong>").append(escapeHtml(searched))
+                    .append("</strong> is a former code. Showing current code details below:")
+                    .append("</p>");
+
                 for (String currentCd : currentCodes) {
                     Map<String, Object> detailArgs = map("locCd", currentCd);
                     String detailResult = mcpClient.callTool("hardcode_query", detailArgs);
                     result.addToolCall("hardcode_query", detailArgs, detailResult);
 
-                    html.append("<div style='margin-top:16px;"
-                            + "border-top:2px solid #0f3460;"
-                            + "padding-top:16px;'>");
-                    html.append("<p class='answer-summary'>")
-                            .append("📍 Details for current code: <code>")
-                            .append(escapeHtml(currentCd))
-                            .append("</code></p>");
-                    html.append(formatAsHtml(detailResult));
-                    html.append("</div>");
+                    html.append("<div style='margin-top:16px;border-top:2px solid #f0a500;padding-top:16px;'>")
+                        .append("<p class='answer-summary'>📍 Current code: <code>")
+                        .append(escapeHtml(currentCd))
+                        .append("</code></p>")
+                        .append(formatAsHtml(detailResult))
+                        .append("</div>");
                 }
-            } else {
-                log.warn("⚠️ Chain 1: no current codes found in history result");
-                html.append("<p class='answer-summary'>"
-                        + "⚠️ No current code found in history.</p>");
             }
         }
 
         // ── Chain 2: PSM_LOCATIONS + autoFetchFirst ───────────────────
         // Trigger: PSM_LOCATIONS intent with autoFetchFirst=true
         // Action:  fetch full details for first location in results
-        if (intent.type == QueryPlanner.IntentType.PSM_LOCATIONS
+        if (intent.type == Intent.PSM_LOCATIONS
                 && "true".equals(intent.params.get("autoFetchFirst"))
                 && !lastCodes.isEmpty()) {
 
@@ -3323,5 +3494,219 @@ public class OllamaService {
         }
 
         return corrected;
+    }
+    
+    /**
+     * LEFT JOIN style merge:
+     * - Keeps ALL results from monumentResult (left)
+     * - Adds GRD_HIST_BLDG from historicResult where LOC_CD matches
+     * - Deduplicates by LOC_CD
+     */
+    private String enrichWithHistoricGrade(
+        String monumentResult,
+        String historicResult,
+        String gradeFilter) {      // ← new param
+
+	    try {
+	        JsonNode monNode  = mapper.readTree(monumentResult);
+	        JsonNode histNode = mapper.readTree(historicResult);
+	
+	        JsonNode monArr  = monNode.path("results");
+	        JsonNode histArr = histNode.path("results");
+	
+	        if (!monArr.isArray()) return monumentResult;
+	
+	        // Build grade lookup: LOC_CD → GRD_HIST_BLDG
+	        Map<String, String> gradeMap = new LinkedHashMap<String, String>();
+	        if (histArr.isArray()) {
+	            for (JsonNode item : histArr) {
+	                String cd    = item.path("LOC_CD").asText("").trim().toUpperCase();
+	                String grade = item.path("GRD_HIST_BLDG").asText("").trim();
+	                if (!cd.isEmpty()) gradeMap.put(cd, grade);
+	            }
+	        }
+	        log.info("🔗 Grade lookup built: {} entries", gradeMap.size());
+	
+	        // Determine filter mode
+	        boolean filterToGraded    = "GRADED".equals(gradeFilter);
+	        boolean filterToSpecific  = gradeFilter != null
+	                && !gradeFilter.isEmpty()
+	                && !"ALL".equals(gradeFilter)
+	                && !"GRADED".equals(gradeFilter);
+	
+	        Set<String>              seen   = new LinkedHashSet<String>();
+	        List<Map<String,Object>> merged = new ArrayList<Map<String,Object>>();
+	
+	        for (JsonNode item : monArr) {
+	            String cd = item.path("LOC_CD").asText("").trim().toUpperCase();
+	            if (cd.isEmpty() || !seen.add(cd)) continue; // deduplicate
+	
+	            String grade = gradeMap.get(cd);  // null if not in historic table
+	
+	            // ── Apply grade filter ────────────────────────────────────
+	            if (filterToGraded && (grade == null || grade.isEmpty())) {
+	                continue; // skip ungraded
+	            }
+	            if (filterToSpecific && !gradeFilter.equals(grade)) {
+	                continue; // skip wrong grade
+	            }
+	
+	            // Convert to mutable map
+	            Map<String, Object> row = new LinkedHashMap<String, Object>();
+	            Iterator<Map.Entry<String, JsonNode>> fields = item.fields();
+	            while (fields.hasNext()) {
+	                Map.Entry<String, JsonNode> e = fields.next();
+	                row.put(e.getKey(), e.getValue().asText(""));
+	            }
+	
+	            // Inject grade
+	            row.put("GRD_HIST_BLDG", grade != null && !grade.isEmpty()
+	                    ? grade : "N/A");
+	
+	            merged.add(row);
+	        }
+	
+	        Map<String, Object> response = new LinkedHashMap<String, Object>();
+	        response.put("count",    merged.size());
+	        response.put("results",  merged);
+	        response.put("filter",   monNode.path("filter").asText("T"));
+	        response.put("enriched", true);
+	        if (gradeFilter != null) response.put("gradeFilter", gradeFilter);
+	
+	        log.info("🔗 Enriched result: {} monuments match grade filter '{}'",
+	                merged.size(), gradeFilter);
+	
+	        return mapper.writeValueAsString(response);
+	
+	    } catch (Exception e) {
+	        log.error("enrichWithHistoricGrade error: {}", e.getMessage());
+	        return monumentResult;
+	    }
+	}
+ // ── Referential word patterns ─────────────────────────────────────────
+    private static final Pattern REFERENTIAL_PATTERN = Pattern.compile(
+            "\\b(these|those|this location|that location|them|the above|previous locations)\\b",
+            Pattern.CASE_INSENSITIVE
+    );
+
+    // ── Prompt patterns that want info/details ────────────────────────────
+    private static final Pattern INFO_REQUEST_PATTERN = Pattern.compile(
+        "(?i)^(get|show|find|fetch|display|tell me|give me|what is|info|"
+        + "details|information|retrieve)\\b"
+    );
+
+    /**
+     * If the prompt contains referential words ("that", "it", "those")
+     * AND the session has remembered codes, rewrite the prompt to be specific.
+     *
+     * Examples:
+     *   "Get info for that"        → "Get info for AB04400215002"
+     *   "show reports for those"   → "show reports for AB04400215002, CC04400144000"
+     *   "check BSI for them"       → "check BSI for AB04400215002, CC04400144000"
+     */
+    private String resolveReferentialPrompt(String prompt, String sessionId) {
+        if (prompt == null || prompt.trim().isEmpty()) return prompt;
+
+        // ── 2. Strip verifier retry warnings so they don't trigger memory dumps ──
+        String cleanPrompt = prompt.replaceAll("\\[Previous answer was flagged:.*?\\]", "").trim();
+
+        // Only resolve if clean prompt contains a true referential pointer word
+        if (!REFERENTIAL_PATTERN.matcher(cleanPrompt).find()) {
+            return prompt;
+        }
+
+        // Only resolve if we have session memory
+        List<String> lastCodes = getLastResults(sessionId);
+        if (lastCodes.isEmpty()) {
+            log.info("🔗 Referential prompt but no session memory — leaving as-is");
+            return prompt;
+        }
+
+        // For single code: replace referential word with the code
+        // For multiple codes: append all codes
+        String codeList;
+        if (lastCodes.size() == 1) {
+            codeList = lastCodes.get(0);
+        } else {
+            // Limit to first 10 to avoid extremely long prompts
+            List<String> limited = lastCodes.subList(0, Math.min(10, lastCodes.size()));
+            codeList = String.join(", ", limited);
+        }
+
+        // Replace the referential word(s) in the original prompt
+        String resolved = REFERENTIAL_PATTERN.matcher(prompt)
+                .replaceFirst(codeList);
+
+        log.info("🔗 Referential resolution: '{}' codes in memory, using: {}",
+                lastCodes.size(), codeList);
+
+        return resolved;
+    }
+    
+    /**
+     * Sanitize LLM-extracted grade values.
+     * LLM sometimes returns "NOT NULL", "NONE", "any", etc.
+     * Only allow: null, "1", "2", "3", "ALL", "NONE"
+     */
+    private String sanitizeGrade(String grade) {
+        if (grade == null) return null;
+
+        String g = grade.trim().toUpperCase();
+
+        switch (g) {
+            case "1": case "2": case "3":
+                return g;
+            case "ALL": case "ANY": case "SOME":
+                return "ALL";
+            case "NONE": case "0": case "NULL": case "NO GRADE":
+                return "NONE";
+            case "NOT NULL": case "NON-NULL": case "GRADED": case "HAS GRADE":
+                // User wants only graded ones — return special sentinel
+                return "GRADED";
+            default:
+                log.warn("⚠️ Unknown grade value '{}' — defaulting to ALL", grade);
+                return "ALL";
+        }
+    }
+
+    public AgentResult runAgentWithTools(String prompt, String sessionId)
+            throws Exception {
+        return this.invoke(prompt, sessionId);
+    }
+    
+    private List<String> extractFormerCodesFromHistory(String historyResult) {
+        List<String> codes = new ArrayList<>();
+        if (historyResult == null || historyResult.isEmpty()) return codes;
+
+        try {
+            com.fasterxml.jackson.databind.ObjectMapper mapper =
+                new com.fasterxml.jackson.databind.ObjectMapper();
+            String jsonStr = historyResult.trim();
+
+            if (jsonStr.startsWith("{") && jsonStr.contains("\"rows\"")) {
+                com.fasterxml.jackson.databind.JsonNode root = mapper.readTree(jsonStr);
+                if (root.has("rows")) jsonStr = root.get("rows").toString();
+            }
+
+            if (jsonStr.startsWith("[")) {
+                for (com.fasterxml.jackson.databind.JsonNode row : mapper.readTree(jsonStr)) {
+                    if (row.has("FORMER_LOC_CD") && !row.get("FORMER_LOC_CD").isNull()) {
+                        String cd = row.get("FORMER_LOC_CD").asText().trim().toUpperCase();
+                        if (!cd.isEmpty() && !codes.contains(cd)) codes.add(cd);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // Fallback: regex
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("FORMER_LOC_CD[\":\\s]+([A-Z]{2}\\d{11})", 
+                         java.util.regex.Pattern.CASE_INSENSITIVE)
+                .matcher(historyResult);
+            while (m.find()) {
+                String cd = m.group(1).toUpperCase();
+                if (!codes.contains(cd)) codes.add(cd);
+            }
+        }
+        return codes;
     }
 }

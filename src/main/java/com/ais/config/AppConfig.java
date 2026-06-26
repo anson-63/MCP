@@ -115,12 +115,12 @@ public class AppConfig {
     public static int    dbPoolMinIdle()        { return getInt("db.pool.min_idle", 2); }
     public static int    dbConnectionTimeout()  { return getInt("db.connection_timeout", 30000); }
     
-    public static String ollamaBaseUrl()        { return get("ollama.base_url", "http://localhost:11434"); } //hardcode default
+    public static String ollamaBaseUrl()        { return get("ollama.base_url", "http://<ollama-ip>:11434"); } //hardcode default
     public static String ollamaModel()          { return get("ollama.model", "qwen3:4b-q4_K_M"); } //hardcode default
     public static int    ollamaNumCtx()         { return getInt("ollama.num_ctx", 2048); } //hardcode default
     public static double ollamaTemperature()    { return getDouble("ollama.temperature", 0.0); } //hardcode default
     public static int    ollamaTimeoutSeconds() { return getInt("ollama.timeout_seconds", 120); } //hardcode default
     
-    public static String reportAisBase()        { return get("report.url.ais_base", "domain"); } //hardcode default
+    public static String reportAisBase()        { return get("report.url.ais_base", "https://domain/"); } //hardcode default
     public static String reportDssrBase()       { return get("report.url.dssr_base", "http://domain/asdiis/sebiis/2k/application/dssr/reportmain.aspx"); } //hardcode default
 }
