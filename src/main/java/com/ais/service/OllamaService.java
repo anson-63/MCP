@@ -2752,22 +2752,25 @@ public class OllamaService {
      * fails (caller should fallback gracefully).
      */
     public ExtractedKeywords extractKeywords(String userPrompt) {
-        // Check if this is a verifier retry loop
         boolean isRetry = userPrompt.contains("[Previous answer was flagged");
-
-        // Cache check (only if NOT a retry)
         String cacheKey = userPrompt.trim().toLowerCase();
+
         if (!isRetry) {
+            // ── 1. CHECK REGEX TEMPLATE GATEWAY (0ms Fast Path) ──
+            ExtractedKeywords templateMatch = matchExactTemplatePrompt(userPrompt);
+            if (templateMatch != null) {
+                return templateMatch;
+            }
+
+            // ── 2. CHECK KEYWORD CACHE ──
             ExtractedKeywords cached = kwCache.get(cacheKey);
             if (cached != null) {
                 log.info("⚡ Keyword cache hit");
                 return cached;
             }
-        } else {
-            log.info("⚠️ Verifier retry detected — bypassing keyword cache");
         }
 
-        // Call LLM
+        // ── 3. FALL BACK TO OLLAMA LLM EXTRACTION ──
         ExtractedKeywords result = extractKeywordsFromLlm(userPrompt);
         if (result != null && !isRetry) {
             kwCache.put(cacheKey, result);
@@ -3708,5 +3711,60 @@ public class OllamaService {
             }
         }
         return codes;
+    }
+
+    private ExtractedKeywords matchExactTemplatePrompt(String prompt) {
+        if (prompt == null) return null;
+        String clean = prompt.trim();
+
+        // Template 1: "Get info for [LOC_CD]"
+        Matcher mInfo = Pattern.compile("(?i)^Get info for ([A-Z0-9]{11,15})$").matcher(clean);
+        if (mInfo.matches()) {
+            ExtractedKeywords kw = new ExtractedKeywords();
+            kw.setIntents(Collections.singletonList("LOCATION_CODE"));
+            kw.setLocationCode(mInfo.group(1).toUpperCase());
+            log.info("🎯 Exact Template Match: Get info for {}", kw.getLocationCode());
+            return kw;
+        }
+
+        // Template 2: "Show locations for department [DEPT]"
+        Matcher mDept = Pattern.compile("(?i)^Show locations for department ([A-Z]{2,6})$").matcher(clean);
+        if (mDept.matches()) {
+            ExtractedKeywords kw = new ExtractedKeywords();
+            kw.setIntents(Collections.singletonList("DEPARTMENT"));
+            kw.setDepartment(mDept.group(1).toUpperCase());
+            log.info("🎯 Exact Template Match: Show locations for department {}", kw.getDepartment());
+            return kw;
+        }
+
+        // Template 3: "Show locations under PSM [PSM_NAME]"
+        Matcher mPsm = Pattern.compile("(?i)^Show locations under PSM/?([A-Z0-9 .&()_-]+)$").matcher(clean);
+        if (mPsm.matches()) {
+            ExtractedKeywords kw = new ExtractedKeywords();
+            kw.setIntents(Collections.singletonList("PSM"));
+            kw.setPsm(mPsm.group(1).toUpperCase());
+            log.info("🎯 Exact Template Match: Show locations under PSM {}", kw.getPsm());
+            return kw;
+        }
+
+        // Template 4: "List all PSMs"
+        if (clean.equalsIgnoreCase("List all PSMs") || clean.equalsIgnoreCase("show PSMs")) {
+            ExtractedKeywords kw = new ExtractedKeywords();
+            kw.setIntents(Collections.singletonList("PSM"));
+            log.info("🎯 Exact Template Match: List all PSMs");
+            return kw;
+        }
+
+        // Template 5: "Search location code history for [LOC_CD]"
+        Matcher mHist = Pattern.compile("(?i)^Search location code history for ([A-Z0-9]{11,15})$").matcher(clean);
+        if (mHist.matches()) {
+            ExtractedKeywords kw = new ExtractedKeywords();
+            kw.setIntents(Collections.singletonList("CODE_HISTORY"));
+            kw.setLocationCode(mHist.group(1).toUpperCase());
+            log.info("🎯 Exact Template Match: Search location code history for {}", kw.getLocationCode());
+            return kw;
+        }
+
+        return null; // No exact match -> Fall back to Ollama LLM Extraction!
     }
 }
