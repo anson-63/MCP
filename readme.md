@@ -1,6 +1,6 @@
 # AIS Assistant Web
 
-A Java web application that lets users ask questions about location data through a chat interface. The app uses a Servlet/JSP frontend, a SQL Server database, and an Ollama-based LLM agent that can call tools to search location records.
+A Java web application that lets users ask questions about location data through a chat interface. The app uses a Servlet/JSP frontend, a SQL Server database, an Ollama-based LLM agent that can call tools to search location records, and a **LangGraph-style verification graph** that validates every LLM response before it reaches the user.
 
 ## Table of contents
 
@@ -9,6 +9,7 @@ A Java web application that lets users ask questions about location data through
 - [User guide](#user-guide)
 - [Sample prompts](#sample-prompts)
 - [Developer guide](#developer-guide)
+- [Verification graph](#verification-graph)
 - [API endpoints](#api-endpoints)
 - [SQL manual inspect](#sql-manual-inspect)
 - [New capabilities](#new-capabilities)
@@ -34,6 +35,7 @@ A Java 8 webapp packaged as a WAR and deployed to Tomcat 9. It provides:
 - deterministic query planning with keyword extraction and fast paths,
 - a tool dispatch table plus UI metadata for dynamic quick prompt generation,
 - LLM-driven tool calls via Ollama when needed,
+- **a LangGraph-style multi-node verification graph that validates every LLM response before it is shown to the user**,
 - database schema inspection and refresh support.
 
 ---
@@ -51,6 +53,7 @@ A Java 8 webapp packaged as a WAR and deployed to Tomcat 9. It provides:
 | Connection pool | HikariCP 4.x |
 | HTTP client | OkHttp 4.x (used to call Ollama) |
 | AI / LLM | Ollama (local, tool-calling mode) |
+| Agent graph | Custom Java LangGraph-style state machine |
 | JSON | Jackson (ObjectMapper) |
 | Logging | SLF4J + Logback |
 
@@ -76,6 +79,7 @@ A Java 8 webapp packaged as a WAR and deployed to Tomcat 9. It provides:
 - Show available report cards with links to open report details.
 - Database schema inspection endpoint, including schema refresh support.
 - Ollama tool-based responses, including TMCP/TMIS, PSM usage, and SQL query generation for complex questions.
+- **LangGraph-style response verification: every answer is checked by a second LLM call before being shown to the user, with automatic retry on failure.**
 
 ### Prerequisites
 
@@ -83,7 +87,7 @@ A Java 8 webapp packaged as a WAR and deployed to Tomcat 9. It provides:
 - Apache Maven 3.8+.
 - Apache Tomcat 9 (Servlet API 4.0, JSP API 2.3).
 - SQL Server database accessible from your machine.
-- Ollama installed and reachable.
+- Ollama installed and reachable at the URL configured in `application.properties`.
 - A compatible Ollama model (default: `qwen3:4b-q4_K_M`).
 
 ### Run locally
@@ -98,7 +102,7 @@ mvn clean package
 
 3. Open the web UI at:
 
-```text
+```
 http://localhost:8090/ais_ai/
 ```
 
@@ -107,8 +111,10 @@ http://localhost:8090/ais_ai/
 1. Open the web UI.
 2. Enter a location code such as `SB04400361000`, a comma-separated list like `SB04400361000,SB04400362000`, or a location name like `Sha Tin Park`.
 3. The assistant will:
+   - run the query through the verification graph,
    - decide which tool to call,
    - query the database,
+   - verify the response with a second LLM call,
    - display a formatted result table.
 4. Use the fast prompt buttons above the chat input to run common queries instantly or prefill the input for custom searches.
 5. If related reports exist, it will show report cards with links.
@@ -262,10 +268,10 @@ http://localhost:8090/ais_ai/
 
 | Sample prompt | Procedure |
 |---|---|
-| `Search location code history for UD04400253000` | `search_loc_cd_history(formerLocCd=UD04400253000, currentLocCd=UD04400253000)` → if current code found → `hardcode_query(locCd=currentCode)` |
-| `what is the new code for UD04400253000` | `search_loc_cd_history(formerLocCd=UD04400253000, currentLocCd=UD04400253000)` → if current code found → `hardcode_query(locCd=currentCode)` |
-| `what was the old code for UC04400251000` | `search_loc_cd_history(formerLocCd=UC04400251000, currentLocCd=UC04400251000)` |
-| `former code UD04400253000` | `search_loc_cd_history(formerLocCd=UD04400253000, currentLocCd=UD04400253000)` |
+| `Search location code history for UD04400253000` | `search_loc_cd_history(formerLocCd=UD04400253000, currentLocCd=UD04400253000)` → searched code matches former → auto-trigger `hardcode_query(locCd=currentCode)` |
+| `what is the new code for UD04400253000` | `search_loc_cd_history(...)` → searched code matches former → auto-trigger `hardcode_query(locCd=currentCode)` |
+| `what was the old code for UC04400251000` | `search_loc_cd_history(...)` → searched code matches current → show history only, no auto-trigger |
+| `former code UD04400253000` | `search_loc_cd_history(...)` → searched code matches former → auto-trigger `hardcode_query(locCd=currentCode)` |
 
 </details>
 
@@ -276,7 +282,7 @@ http://localhost:8090/ais_ai/
 
 | Sample prompt | Procedure |
 |---|---|
-| `Find former code of UD04400253000 and check if it has BSI report` | `search_loc_cd_history(formerLocCd=UD04400253000, currentLocCd=UD04400253000)` → extract current code(s) → `check_reports(reportType=BSI, locCds=[currentCodes])` |
+| `Find former code of UD04400253000 and check if it has BSI report` | `search_loc_cd_history(...)` → extract current code(s) → `check_reports(reportType=BSI, locCds=[currentCodes])` |
 | `Search location code history for UD04400253000 and check KAI report` | `search_loc_cd_history(...)` → extract current code(s) → `check_reports(reportType=KAI, locCds=[currentCodes])` |
 | `Get current code for UD04400253000 and show DSSR report` | `search_loc_cd_history(...)` → extract current code(s) → `check_reports(reportType=DSSR, locCds=[currentCodes])` |
 
@@ -322,7 +328,7 @@ http://localhost:8090/ais_ai/
 | `Show locations for department …` | `AFCD` | `Show locations for department AFCD` | `locations_by_dept(deptCd=AFCD)` |
 | `Show declared monuments …` | `T` / `F` / `ALL` | `Show declared monuments T` | `search_declared_monument(filter=T)` |
 | `Show historic buildings grade …` | `1` / `2` / `3` / `ALL` / `NONE` | `Show historic buildings grade 2` | `search_historic_building(grade=2)` |
-| `Search location code history for …` | `UD04400253000` | `Search location code history for UD04400253000` | `search_loc_cd_history(...)` → if current code found → `hardcode_query(...)` |
+| `Search location code history for …` | `UD04400253000` | `Search location code history for UD04400253000` | `search_loc_cd_history(...)` → searched code matches former → auto-trigger `hardcode_query(...)` |
 | `Check BSI reports for …` | `SB04400361000,SC04400206005` | `Check BSI reports for SB04400361000,SC04400206005` | `check_reports(reportType=BSI, locCds=[...])` |
 
 </details>
@@ -338,7 +344,7 @@ http://localhost:8090/ais_ai/
 
 User prompt:
 
-```text
+```
 which of these have BSI report: AA00200081000 BB04400174001 RB01800059000 SB03206014369 AB01900272000
 ```
 
@@ -363,7 +369,7 @@ Example response summary:
 
 User prompt:
 
-```text
+```
 how about KAI report
 ```
 
@@ -378,7 +384,7 @@ Example response summary:
 
 User prompt:
 
-```text
+```
 show AFCD locations with BSI report
 ```
 
@@ -393,7 +399,7 @@ Example response summary:
 
 User prompt:
 
-```text
+```
 info of sha tin park
 ```
 
@@ -409,7 +415,7 @@ This can return multiple matching locations, for example:
 
 Then ask:
 
-```text
+```
 which of these has DSSR report
 ```
 
@@ -420,7 +426,7 @@ Example result summary:
 
 And asking again for KAI:
 
-```text
+```
 how about KAI report
 ```
 
@@ -437,22 +443,34 @@ Example result summary:
 
 ### Project structure
 
-```text
+```
 project-root/
 ├── pom.xml
-├── README.md                          ← not included in WAR
+├── README.md
 └── src/
     ├── main/
     │   ├── java/com/ais/
     │   │   ├── config/
     │   │   │   └── AppConfig.java
     │   │   ├── controller/
-    │   │   │   ├── ChatServlet.java
+    │   │   │   ├── ChatServlet.java         ← entry point, runs verification graph
     │   │   │   ├── LocationServlet.java
     │   │   │   ├── ReportServlet.java
     │   │   │   └── ToolsServlet.java
     │   │   ├── db/
     │   │   │   └── DatabaseManager.java
+    │   │   ├── graph/                       ← LangGraph-style verification layer
+    │   │   │   ├── AgentGraph.java          ← graph engine (compile + invoke)
+    │   │   │   ├── GraphEdge.java           ← conditional routing interface
+    │   │   │   ├── GraphNode.java           ← node interface
+    │   │   │   ├── GraphState.java          ← shared state passed between nodes
+    │   │   │   ├── VerificationGraphFactory.java ← wires all nodes together
+    │   │   │   └── nodes/
+    │   │   │       ├── PlannerNode.java     ← Node 1: intent detection
+    │   │   │       ├── PrimaryLlmNode.java  ← Node 2: calls OllamaService
+    │   │   │       ├── VerifierNode.java    ← Node 3: second LLM verification
+    │   │   │       ├── FormatterNode.java   ← Node 4: formats approved response
+    │   │   │       └── FallbackNode.java    ← Node 5: handles rejected responses
     │   │   ├── model/
     │   │   │   ├── ChatMessage.java
     │   │   │   ├── LocationInfo.java
@@ -479,19 +497,11 @@ project-root/
         └── java/
 ```
 
-> `README.md`, `pom.xml`, `.classpath`, `.project`, `.settings/`, and `bin/` are **not** included in the
-generated WAR file. Only `src/main/webapp/` and compiled classes from `src/main/java/` and
-`src/main/resources/` are packaged.
->
-> Compiled inner classes now include:
-> - `OllamaService$ExtractedKeywords.class`
-> - `MCPClientService$ToolDef.class`
-> - `DatabaseManager$LocationQuery.class`
-
 ### Architecture
 
 - **Presentation layer:** JSP pages under `src/main/webapp/jsp` and servlets in `src/main/java/com/ais/controller`.
-- **Controller layer:** `ChatServlet` handles `/api/chat`, `ToolsServlet` serves `/api/tools`, `LocationServlet` serves `/api/location/schema` and `/api/location/general-info`, and `ReportServlet` renders report view pages.
+- **Controller layer:** `ChatServlet` handles `/api/chat` and runs every prompt through the verification graph. `ToolsServlet` serves `/api/tools`. `LocationServlet` serves `/api/location/schema` and `/api/location/general-info`. `ReportServlet` renders report view pages.
+- **Verification graph layer:** `com/ais/graph/` contains the LangGraph-style agent graph. Every chat request passes through five nodes: planner → primary LLM → verifier → formatter (or fallback). See [Verification graph](#verification-graph).
 - **Service layer:** `OllamaService`, `MCPClientService`, `QueryPlanner` in `src/main/java/com/ais/service`.
 - **Data layer:** `DatabaseManager` in `src/main/java/com/ais/db/DatabaseManager.java` handles SQL, report discovery, slope/TMCP/TMIS helpers, and URL construction.
 - **Configuration:** centralized in `src/main/resources/application.properties`, loaded via `src/main/java/com/ais/config/AppConfig.java` with optional external override via `APP_CONFIG_PATH` or `-Dapp.config`.
@@ -502,47 +512,49 @@ generated WAR file. Only `src/main/webapp/` and compiled classes from `src/main/
 
 ### Request flow
 
-```text
+```
 Browser
   │
   ▼
 index.jsp (JSP + Vanilla JS)
-  │  POST /api/chat
+  │  POST /api/chat  { "prompt": "..." }
   ▼
 ChatServlet.java
+  │  builds GraphState, calls verificationGraph.invoke(state)
+  ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   VERIFICATION GRAPH                         │
+│                                                             │
+│  [PlannerNode]                                              │
+│      detect intent from query text                          │
+│      ↓ (unconditional edge)                                 │
+│  [PrimaryLlmNode]                                           │
+│      OllamaService.invoke(prompt, sessionId)                │
+│        ├─ extractKeywords()    Phase 1 (always)             │
+│        ├─ QueryPlanner.analyse()                            │
+│        ├─ executePlan()        fast path                    │
+│        └─ runAgentLoop()       LLM path if needed           │
+│      ↓ (unconditional edge)                                 │
+│  [VerifierNode]                                             │
+│      second Ollama call with verification prompt            │
+│      returns APPROVED / RETRY / REJECTED                    │
+│      ↓ (conditional edge)                                   │
+│      ├── APPROVED ──────────► [FormatterNode] → finalResponse
+│      ├── RETRY (canRetry) ──► back to PrimaryLlmNode        │
+│      └── max retries done ──► [FormatterNode] best effort   │
+└─────────────────────────────────────────────────────────────┘
   │
   ▼
-OllamaService.invoke()
-  │
-  ├─► extractKeywords()          ← Phase 1: always runs (KEYWORD_EXTRACT_PROMPT, 1024 ctx)
-  │     Returns: ExtractedKeywords{intent, locationCode, locationName, reportType, department, psm, grade, filter, modifier, rawKeywords}
-  │
-  ├─► QueryPlanner.analyse(prompt, keywords)
-  │     Returns: Plan{steps[], needsLlm}
-  │
-  ├─── needsLlm=false ──► executePlan()
-  │                          buildArgs() → resolveToolName() → callTool() → applyModifier()
-  │
-  └─── needsLlm=true  ──► runAgentLoop()   ← Phase 2: only for complex queries
-  │                            SYSTEM_PROMPT + injected keyword context
-  │                            → Ollama LLM selects tools
+ChatServlet builds JSON response:
+  { answer, toolCalls, elapsedMs, verified, verificationResult, retries }
   │
   ▼
-MCPClientService.callTool()     ← dispatch table (handlers map)
-  │
-  ▼
-DatabaseManager                  ← universal query builder + DB-side location filter
-  │
-  ▼
-SQL Server (ais schema + GIS schema)
+index.jsp renders answer + tool call accordion in chat UI
 ```
 
 ### Registered Ollama tools
 
-All search tools now accept an optional `location` parameter for DB-side filtering. The location filter is applied in SQL and returns only the matching subset of rows.
-
-Tools are defined in `MCPClientService.getToolDefs()` and exposed to the UI via `MCPClientService.listToolsForUI()`. Each tool includes UI metadata that is automatically
-rendered as a quick prompt button in `index.jsp` via `GET /api/tools`.
+All search tools now accept an optional `location` parameter for DB-side filtering.
 
 | Tool | Args | Description |
 |---|---|---|
@@ -550,102 +562,61 @@ rendered as a quick prompt button in `index.jsp` via `GET /api/tools`.
 | `search_by_name` | `locName`, `location?` | Partial match by name, optional district filter |
 | `check_reports` | `reportType`, `locCds[]` | Bulk availability check across locations |
 | `list_psms` | _(none)_ | All distinct PSMs with counts |
-| `locations_by_psm` | `psm`, `location?` | Locations under a specific PSM, optional district filter |
-| `locations_by_dept` | `deptCd`, `location?` | Locations owned/managed by a department, optional district filter |
-| `search_declared_monument` | `filter`, `location?` | Declared monument lookup (T/F/ALL), optional district filter |
-| `search_historic_building` | `grade`, `location?` | Historic building lookup by grade, optional district filter |
+| `locations_by_psm` | `psm`, `location?` | Locations under a specific PSM |
+| `locations_by_dept` | `deptCd`, `location?` | Locations owned/managed by a department |
+| `search_declared_monument` | `filter`, `location?` | Declared monument lookup (T/F/ALL) |
+| `search_historic_building` | `grade`, `location?` | Historic building lookup by grade |
 | `search_loc_cd_history` | `formerLocCd`, `currentLocCd` | Location code history lookup |
 | `show_schema` | _(none)_ | Database schema introspection |
 
 ### Dynamic quick prompt buttons
 
-Quick prompt buttons in `index.jsp` are **not hardcoded**. They are fetched from `GET /api/tools` on page
-load and rendered automatically from tool UI metadata defined in `MCPClientService.getToolDefs()`.
-
-Each tool definition includes:
-
-| Field | Description |
-|---|---|
-| `icon` | Emoji icon shown on the button |
-| `samplePrompt` | Text prefilled into the input box |
-| `needsInput` | If `true`, button prefills input and waits; if `false`, button auto-sends |
-| `inputHint` | Badge label shown on the button (e.g. `+ location code`) |
-| `placeholder` | Input placeholder hint shown after prefill |
-
-To add a new quick prompt button, simply add a new `ToolDef` in `MCPClientService.getToolDefs()` with UI metadata.
-No frontend changes are needed.
-
-### Smart routing & memory
-
-`OllamaService.invoke()` now uses `QueryPlanner` to analyze the user prompt and execute a deterministic plan when possible.
-
-- The first phase always runs `extractKeywords()` and populates `OllamaService.ExtractedKeywords`.
-- `QueryPlanner.analyse(prompt, keywords)` uses extracted keywords to build a plan or decide whether the agent loop is needed.
-- Intent analysis detects PSM, department, historic building, monument, code-history, report checks, and direct code queries.
-- Exact `^[A-Z]{2}\d{11}$` input → direct single `hardcode_query` lookup.
-- Multiple location codes → codes are saved in session memory and rendered as a code list for follow-up queries.
-- Simple name searches may bypass LLM and use `search_by_name` directly.
-- `hardcode_query` auto-falls back to `search_by_name` when input is not a valid code.
-- If extracted keywords indicate `UNKNOWN` or `SQL_QUERY`, the service first attempts direct SQL generation before the agent loop; if that result is not useful it falls back to LLM-driven tool planning, then to SQL fallback again.
-- Modifier support is applied after tool calls: `OLDEST`, `NEWEST`, `FIRST`, and `COUNT`.
-- `PSM/xxx` inputs can trigger `locations_by_psm` or `check_reports` over PSM locations.
-- Department queries can trigger `locations_by_dept` and optional report checks.
-- Code-history requests (`former code`, `old code`, `current code`) use `search_loc_cd_history` and can chain to location lookups or report checks.
-- `FETCH_CURRENT` is supported for code-history intents to automatically fetch details for the current LOC_CD if the planner decides it is needed.
-- Fallback → Ollama agent loop with registered tools when the prompt is too complex for deterministic planning.
-
-Session memory is stored in `OllamaService.LAST_RESULTS` as a `ConcurrentHashMap` keyed by `HttpSession.getId()`.
-
-- Saved when: `search_by_name`, `locations_by_psm`, `locations_by_dept`, or `search_loc_cd_history` returns results, or when multiple codes are provided.
-- Cleared when: a single code lookup occurs or a new unrelated topic starts.
-- Lifespan: memory persists until Tomcat restart.
-
-### Slope location support
-
-The app detects slope locations when `A_GENERAL_INFO.LOC_NAME` contains `Slope` (case-insensitive).
-For slope locations, standard reports (`BSI`, `CSR`, `KAI`, `EMMS`, `DSSR`) are skipped.
-
-Slope reports come from `ais.Slope_Report_Info`, grouped by URL pattern:
-
-- `BWCS` — Boundary & Works Completion Survey
-- `VMI` — Visual Maintenance Inspection
-- `RMI` — Routine Maintenance Inspection
-- `AMI` — Annual Maintenance Inspection
-
-TMCP/TMIS forms are loaded from six tables and grouped into Form 1 / Form 2:
-
-- `TMCP_FORM_ONE_LINK`, `TMCP_FORM_ONE_NEW_LINK` → Form 1
-- `TMCP_FORM_TWO_LINK`, `TMCP_FORM_TWO_NEW_LINK` → Form 2
-- `TMIS_FORM_ONE_LINK` → Form 1
-- `TMIS_FORM_TWO_LINK` → Form 2
-
-TMCP uses `INSP_DATE`; TMIS uses `APPROVED_DATE`.
+Quick prompt buttons in `index.jsp` are fetched from `GET /api/tools` on page load and rendered from tool UI metadata defined in `MCPClientService.getToolDefs()`. To add a new button, add a new `ToolDef` in `MCPClientService.getToolDefs()`. No frontend changes are needed.
 
 ### Key files and responsibilities
 
 | File | Responsibility |
 |---|---|
-| `controller/ChatServlet.java` | Chat API endpoint, forwards prompts to `OllamaService` |
-| `controller/ToolsServlet.java` | `GET /api/tools` — returns tool UI metadata for dynamic quick prompt buttons |
+| `controller/ChatServlet.java` | Chat API endpoint, builds `GraphState`, invokes verification graph, returns JSON |
+| `controller/ToolsServlet.java` | `GET /api/tools` — returns tool UI metadata |
 | `controller/LocationServlet.java` | Location lookup endpoints and schema introspection |
 | `controller/ReportServlet.java` | Report viewing endpoint and rendering logic |
-| `service/OllamaService.java` | Keyword extraction, fast-path routing, tool orchestration, and LLM agent loop |
-| `service/QueryPlanner.java` | Deterministic prompt analysis and multi-step tool planning; `analyse(prompt, keywords)` accepts extracted keywords |
-| `service/MCPClientService.java` | Tool definitions with UI metadata, dispatch-table tool handlers, and centralized tool execution |
-| `db/DatabaseManager.java` | All SQL access, report metadata, `buildReportUrl(...)`, slope helpers |
+| `graph/AgentGraph.java` | Graph engine: node registry, edge registry, `compile()`, `invoke()` loop |
+| `graph/GraphState.java` | Shared state whiteboard passed between all nodes |
+| `graph/VerificationGraphFactory.java` | Wires the five nodes and edges into a compiled graph at startup |
+| `graph/nodes/PlannerNode.java` | Node 1: detects intent from query text |
+| `graph/nodes/PrimaryLlmNode.java` | Node 2: calls `OllamaService.invoke()`, stores answer in state |
+| `graph/nodes/VerifierNode.java` | Node 3: second Ollama call to verify the primary response |
+| `graph/nodes/FormatterNode.java` | Node 4: sets `finalResponse` and `success=true` |
+| `graph/nodes/FallbackNode.java` | Node 5: returns a safe message when verification fails |
+| `service/OllamaService.java` | Keyword extraction, fast-path routing, tool orchestration, agent loop |
+| `service/QueryPlanner.java` | Deterministic prompt analysis and multi-step tool planning |
+| `service/MCPClientService.java` | Tool definitions, dispatch-table handlers, centralized tool execution |
+| `db/DatabaseManager.java` | All SQL access, report metadata, slope helpers |
 | `service/ReportTypeRegistry.java` | Registry of report type keys and display names |
-| `config/AppConfig.java` | Centralized config loader (properties file → env var → system property) |
-| `webapp/jsp/index.jsp` | Chat UI, dynamic quick prompt buttons rendered from `/api/tools` |
+| `config/AppConfig.java` | Centralized config loader |
+| `webapp/jsp/index.jsp` | Chat UI, dynamic quick prompt buttons |
 
 ### Configuration & environment
 
-Runtime configuration is handled through `src/main/resources/application.properties`.
+#### Common config keys
 
-#### Configuration setup
-
-1. Copy `src/main/resources/application.properties.example` to `src/main/resources/application.properties`.
-2. Fill in real values for DB credentials, Ollama URL, and other settings.
-3. `application.properties` should be gitignored — never commit secrets.
+| Key | Description |
+|---|---|
+| `ollama.base_url` | Ollama server URL (e.g. `http://192.168.1.234:11434`) |
+| `ollama.model` | Primary model name (e.g. `qwen3:4b-q4_K_M`) |
+| `ollama.verifier.model` | Verifier model name — can be the same or a lighter model |
+| `ollama.num_ctx` | Context window size |
+| `ollama.temperature` | LLM temperature |
+| `ollama.timeout_seconds` | HTTP read timeout for Ollama calls |
+| `db.user` | SQL Server username |
+| `db.password` | SQL Server password |
+| `db.server` | SQL Server host |
+| `db.name` | Database name |
+| `db.pool.*` | HikariCP pool settings |
+| `graph.max.retries` | Max verification retries before best-effort fallback (default: 3) |
+| `graph.verification.enabled` | Enable or disable the verifier node |
+| `graph.verification.timeout.seconds` | Timeout for the verifier Ollama call |
 
 #### Config resolution order
 
@@ -655,42 +626,21 @@ Runtime configuration is handled through `src/main/resources/application.propert
 2. `application.properties` on the classpath
 3. Hardcoded default values inside `AppConfig`
 
-#### Common config keys
-
-| Key | Description |
-|---|---|
-| `ollama.base_url` | Ollama server URL (e.g. `http://localhost:11434`) |
-| `ollama.model` | Model name (e.g. `qwen3:4b-q4_K_M`) |
-| `ollama.num_ctx` | Context window size |
-| `ollama.temperature` | LLM temperature |
-| `ollama.timeout_seconds` | HTTP read timeout for Ollama calls |
-| `db.user` | SQL Server username |
-| `db.password` | SQL Server password |
-| `db.server` | SQL Server host |
-| `db.name` | Database name |
-| `db.pool.*` | HikariCP pool settings |
-
-Avoid committing secrets. Use CI/CD or local override files for sensitive values.
-
 ### Build and run
-
-Build the WAR:
 
 ```bash
 mvn clean package
 ```
 
-Deploy the WAR to Tomcat 9 by copying `target/ais_ai.war` to `webapps/`.
+Deploy `target/ais_ai.war` to Tomcat 9 `webapps/`.
 
 ### Production deployment
 
 ```bash
-# On production server
 sudo systemctl stop tomcat
 sudo rm -rf /opt/tomcat/webapps/ais_ai*
 sudo cp ais_ai.war /opt/tomcat/webapps/
 
-# Place external config (NOT in WAR)
 sudo mkdir -p /opt/ais_ai/config
 sudo nano /opt/ais_ai/config/application.properties
 sudo chmod 600 /opt/ais_ai/config/application.properties
@@ -699,7 +649,7 @@ export APP_CONFIG_PATH=/opt/ais_ai/config/application.properties
 sudo systemctl start tomcat
 ```
 
-Smoke test the chat API:
+Smoke test:
 
 ```bash
 curl -X POST \
@@ -712,52 +662,38 @@ curl -X POST \
 
 #### Add or modify report types
 
-1. Register the new type in `ReportTypeRegistry` with a unique key and display label.
-2. Update `DatabaseManager.getReports(...)` with the report metadata: schema.table, id column, filename/path column.
-3. Add or update SQL queries to fetch records for the new report type.
+1. Register the new type in `ReportTypeRegistry`.
+2. Update `DatabaseManager.getReports(...)` with report metadata.
+3. Add SQL queries for the new report type.
 4. Extend `buildReportUrl(...)` to construct the right view URL.
-5. Update UI/JSPs or JSON response fields if the front-end needs the new report data.
 
-#### Add a new tool (and quick prompt button)
+#### Add a new tool and quick prompt button
 
-1. Add a new `ToolDef` in `MCPClientService.getToolDefs()` with all UI metadata fields
-   (`icon`, `samplePrompt`, `needsInput`, `inputHint`, `placeholder`).
-2. Implement the tool execution logic inside `MCPClientService.callTool(...)`.
-3. Add any required database queries to `DatabaseManager`.
-4. The button will appear automatically in `index.jsp` on next page load — no frontend changes needed.
-5. Add unit/integration tests to validate the returned JSON structures.
+1. Add a new `ToolDef` in `MCPClientService.getToolDefs()` with UI metadata fields.
+2. Implement execution logic inside `MCPClientService.callTool(...)`.
+3. Add required database queries to `DatabaseManager`.
+4. The button appears automatically in `index.jsp` — no frontend changes needed.
 
-#### PSM support
+#### Add a new graph node
 
-- PSM exploration is supported via the chat agent using `list_psms` and `locations_by_psm` tool behavior.
-- The database queries are implemented in `DatabaseManager.getDistinctPsms()` and
-  `DatabaseManager.getLocationsByPsm(String psm)`.
-- To extend PSM support, add new tools and/or a REST endpoint if you want a direct HTTP API.
-
-### Testing and verification
-
-- Build and package with Maven.
-- Deploy to Tomcat and verify the web UI loads.
-- Check quick prompt buttons are rendered (fetched from `GET /api/tools`).
-- Verify schema introspection with `GET /api/location/schema`.
-- Test API endpoints directly with `curl`.
-- Validate tool behavior and JSON output in unit/integration tests.
+1. Create a class in `com/ais/graph/nodes/` that implements `GraphNode`.
+2. Register it in `VerificationGraphFactory.build()` with `graph.addNode("name", node)`.
+3. Connect it with `graph.addEdge(...)` or `graph.addConditionalEdge(...)`.
 
 ### Logging, errors & troubleshooting
-
-Logging uses SLF4J with Logback. Check Tomcat logs (`logs/catalina.out`) for errors and stack traces.
 
 #### Common issues
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Empty prompt in logs | Frontend Content-Type mismatch (JSON vs form-urlencoded) | Ensure `Content-Type: application/json` header |
-| `Invalid column name MOD_TIME` | Table missing expected timestamp column | `DatabaseManager.getOrderColumn()` auto-detects; check logs |
+| Empty prompt in logs | Frontend Content-Type mismatch | Ensure `Content-Type: application/json` |
+| `Invalid column name MOD_TIME` | Table missing timestamp column | `DatabaseManager.getOrderColumn()` auto-detects |
 | LLM never responds | Ollama unreachable | Run `curl http://<ollama-ip>:11434/api/tags` |
-| Slope reports showing `OTHER` | URL pattern not matched by `detectSlopeReportType()` | Check logs for unknown URL pattern |
-| `reportId` is ignored in `/report/view` | `ReportServlet` only filters by `LOC_CD` | Fix `getReportData()` to use `reportId` in SQL WHERE clause |
+| Verifier always auto-approves | Wrong `ollama.base_url` (wrong host/port) | Check `ollama.base_url` matches your Ollama server |
+| Verifier rejects valid answers | Verifier prompt too strict | `VerifierNode` remaps REJECTED → RETRY; check logs |
+| Graph loops indefinitely | `MAX_RETRIES` too high or router bug | Check `GraphState.MAX_RETRIES` and router logic |
 | `500` on production only | OkHttp SSL truststore error | See [Known issues & fixes](#known-issues--fixes) |
-| `/api/tools` returns 404 | `ToolsServlet` not compiled or wrong package | Verify `ToolsServlet.class` exists in `target/classes/com/ais/controller/` |
+| `/api/tools` returns 404 | `ToolsServlet` not compiled | Verify class exists in `target/classes/` |
 
 #### Log emoji legend
 
@@ -776,25 +712,118 @@ Logging uses SLF4J with Logback. Check Tomcat logs (`logs/catalina.out`) for err
 | 🏔️ | Slope location detected |
 | 📋 | Slope URL classified |
 
-### Coding conventions
+#### Graph-specific log patterns
 
-- Follow existing project style for spacing and naming.
-- Annotate literal values that cannot be moved to configuration with `//hardcode`.
-- Prefer adding configuration keys to `application.properties` for values that may change across environments.
-
-### Contribution workflow
-
-1. Fork and create a feature branch.
-2. Run tests and build: `mvn clean package`.
-3. Open a PR describing your changes and any database migrations or new config keys.
-
-### Where to look next in code
-
-Follow the request path:
-
-```text
-ChatServlet.java → OllamaService → MCPClientService → DatabaseManager
 ```
+→ Executing node: planner (step 1)        node started
+  Edge → primary_llm                      unconditional edge taken
+→ Executing node: verifier (step 3)       verifier running
+[VerifierNode] Result=APPROVED            verification passed
+[Router] RETRY → primary_llm (attempt 2) retrying after soft rejection
+=== Graph Execution Complete [10863ms, 4 steps] ===
+Execution path: [planner [0ms], primary_llm [10ms], verifier [6807ms], formatter [10863ms]]
+```
+
+---
+
+## Verification graph
+
+### What it is
+
+The verification graph is a **LangGraph-style state machine** implemented in pure Java. Every chat request passes through a fixed sequence of nodes. Each node reads from and writes to a shared `GraphState` object. Conditional edges decide which node runs next based on the current state.
+
+This pattern is equivalent to the Python LangGraph library but built from scratch to run inside a Java EE servlet container with no additional dependencies.
+
+### Why it exists
+
+Without verification, whatever the primary LLM returns goes directly to the user. With the graph:
+
+- A second LLM call independently checks whether the response actually answers the question.
+- If the response is incomplete, the graph retries automatically (up to `MAX_RETRIES` times).
+- If all retries fail, the graph falls back to a safe message rather than showing a bad answer.
+- Every response shown to the user has been verified by a second model call.
+
+### Node descriptions
+
+| Node | Class | What it does |
+|---|---|---|
+| `planner` | `PlannerNode` | Detects intent from the query text (LOCATION_CODE, PSM, DEPARTMENT, etc.) and stores it in state |
+| `primary_llm` | `PrimaryLlmNode` | Calls `OllamaService.invoke(prompt, sessionId)` which runs keyword extraction, query planning, tool calls, and the agent loop. Stores the answer in `state.primaryResponse` |
+| `verifier` | `VerifierNode` | Makes a second Ollama call asking whether the primary response answers the question. Parses the JSON verdict and stores APPROVED / RETRY in state |
+| `formatter` | `FormatterNode` | Copies `primaryResponse` to `finalResponse`, sets `success=true` |
+| `fallback` | `FallbackNode` | Sets a safe error message as `finalResponse`, sets `success=false` |
+
+### Edge routing
+
+```
+planner ──────────────────────────────► primary_llm
+primary_llm ──────────────────────────► verifier
+verifier (APPROVED) ──────────────────► formatter ──► END
+verifier (RETRY, canRetry) ───────────► primary_llm   (increments retryCount)
+verifier (RETRY, maxRetries reached) ─► formatter ──► END  (best-effort answer)
+```
+
+`REJECTED` is remapped to `RETRY` inside `VerifierNode` so the graph always retries before giving up. Only after `MAX_RETRIES` is exhausted does the router send to `formatter` with the best available answer.
+
+### GraphState fields
+
+| Field | Type | Description |
+|---|---|---|
+| `userQuery` | `String` | Original user prompt |
+| `sessionId` | `String` | HTTP session ID for memory lookup |
+| `detectedIntent` | `String` | Intent detected by PlannerNode |
+| `primaryResponse` | `String` | HTML answer from PrimaryLlmNode |
+| `toolCallsMade` | `List<String>` | Tool names called during primary LLM run |
+| `rawToolOutput` | `String` | Text summary of tool outputs |
+| `verificationResult` | `enum` | APPROVED / RETRY / REJECTED / SKIPPED |
+| `verificationReason` | `String` | Verifier's explanation |
+| `retryCount` | `int` | Number of retries so far |
+| `finalResponse` | `String` | Response shown to user |
+| `success` | `boolean` | Whether the graph completed successfully |
+| `executionPath` | `List<String>` | Audit trail of nodes with timestamps |
+
+### LangGraph concept mapping
+
+| LangGraph (Python) | This project (Java) |
+|---|---|
+| `StateGraph(State)` | `AgentGraph` + `GraphState` |
+| `graph.add_node("name", fn)` | `graph.addNode("name", node)` |
+| `graph.add_edge("a", "b")` | `graph.addEdge("a", "b")` |
+| `graph.add_conditional_edges(...)` | `graph.addConditionalEdge(...)` |
+| `graph.set_entry_point(...)` | `graph.setEntryPoint(...)` |
+| `graph.compile()` | `graph.compile()` |
+| `graph.invoke(state)` | `graph.invoke(initialState)` |
+| `TypedDict` state | `GraphState` POJO |
+| Node lambda functions | `GraphNode` interface implementations |
+| Conditional routing function | `GraphEdge` functional interface |
+
+### Verifier behavior
+
+The verifier node sends a short prompt to Ollama asking for a JSON verdict:
+
+```json
+{ "verdict": "APPROVED", "confidence": 0.9, "reason": "Response contains location data" }
+```
+
+Rules applied after parsing the verdict:
+
+- `APPROVED` with confidence below 0.4 is treated as `RETRY`.
+- `REJECTED` is remapped to `RETRY` (the graph always retries before giving up).
+- If Ollama is unreachable, the verifier fails open (auto-approves) so the user still gets an answer.
+- Responses shorter than 100 characters are auto-approved without calling the verifier.
+- Responses matching known failure patterns (`no results found`, `0 results`, etc.) are sent directly to `RETRY` without an Ollama call.
+
+### Verifier fail-open design
+
+The verifier is designed to **never block the user** if the verification service is unavailable:
+
+```
+Verifier Ollama unreachable  → APPROVED (auto) → formatter → user sees answer
+Verifier response unparseable → APPROVED (auto) → formatter → user sees answer
+Verifier times out            → APPROVED (auto) → formatter → user sees answer
+```
+
+This means the graph degrades gracefully to the same behavior as before verification was added.
 
 ---
 
@@ -802,26 +831,20 @@ ChatServlet.java → OllamaService → MCPClientService → DatabaseManager
 
 | Method | URL | Description |
 |---|---|---|
-| `POST` | `/api/chat` | Send a prompt, get an AI-generated answer with tool call results |
-| `GET` | `/api/chat?prompt=...` | Browser-friendly prompt testing for quick checks |
-| `GET` | `/api/tools` | Returns tool UI metadata for rendering quick prompt buttons |
+| `POST` | `/api/chat` | Send a prompt, get a verified AI-generated answer |
+| `GET` | `/api/chat?prompt=...` | Browser-friendly prompt testing |
+| `GET` | `/api/tools` | Returns tool UI metadata for quick prompt buttons |
 | `POST` | `/api/location/general-info` | Get a single location row by `locCd` |
 | `GET/POST` | `/api/location/schema` | Database schema introspection |
-| `GET` | `/report/view?type=<type>&locCd=<locCd>&reportId=<reportId>` | Render a specific report detail page in HTML |
+| `GET` | `/report/view?type=<type>&locCd=<locCd>&reportId=<reportId>` | Render a specific report detail page |
 
 ### Chat endpoint
-
-The chat servlet accepts both JSON POST and browser-friendly GET.
 
 ```bash
 curl -X POST \
   -H "Content-Type: application/json" \
   -d '{"prompt":"Tell me about SB04400361000"}' \
-  __domain__/ais_ai/api/chat
-```
-
-```bash
-curl "__domain__/ais_ai/api/chat?prompt=Tell+me+about+SB04400361000"
+  http://localhost:8090/ais_ai/api/chat
 ```
 
 Example response:
@@ -832,40 +855,27 @@ Example response:
   "toolCalls": [
     {
       "name": "hardcode_query",
-      "args": { "locCd": "SB04400361000" },
-      "result": "{ ... }"
+      "args": "{}",
+      "result": "..."
     }
   ],
-  "elapsedMs": 3241
+  "elapsedMs": 10863,
+  "verified": true,
+  "verificationResult": "APPROVED",
+  "retries": 0
 }
 ```
 
 ### Tools endpoint
 
 ```bash
-curl __domain__/ais_ai/api/tools
-```
-
-Example response:
-
-```json
-[
-  {
-    "name": "hardcode_query",
-    "description": "Get full location details...",
-    "icon": "📋",
-    "samplePrompt": "Get info for ",
-    "needsInput": true,
-    "inputHint": "location code",
-    "placeholder": "e.g., SB04400361000"
-  }
-]
+curl http://localhost:8090/ais_ai/api/tools
 ```
 
 ### Location schema endpoint
 
 ```bash
-curl __domain__/ais_ai/api/location/schema
+curl http://localhost:8090/ais_ai/api/location/schema
 ```
 
 ### Location info endpoint
@@ -874,29 +884,14 @@ curl __domain__/ais_ai/api/location/schema
 curl -X POST \
   -H "Content-Type: application/json" \
   -d '{"locCd":"SB04400361000"}' \
-  __domain__/ais_ai/api/location/general-info
-```
-
-This endpoint is backed by `LocationServlet` and returns the raw row from `ais.A_GENERAL_INFO` for the requested `locCd`.
-
-Example response:
-
-```json
-{
-  "LOC_CD": "SB04400361000",
-  "LOC_NAME": "Example Location",
-  "DEPT_CD": "AFCD",
-  "ADDRESS": "123 Example Road"
-}
-```
+  http://localhost:8090/ais_ai/api/location/general-info
 ```
 
 ---
 
 ## SQL manual inspect
 
-If you want to inspect the database manually before using the app, connect with `sqlcmd` and query schema
-information directly.
+If you want to inspect the database manually before using the app, connect with `sqlcmd` and query schema information directly.
 
 ### 1. Connect to SQL Server
 
@@ -944,104 +939,66 @@ SELECT TOP 10 *
 FROM [ais].[A_GENERAL_INFO];
 ```
 
-> This is useful when you want to confirm exact table names, column names, and sample values before
-> updating the app or prompts.
-
 ---
 
 ## New capabilities
+
+### LangGraph-style verification graph
+
+Every chat response is now validated by a second LLM call before it reaches the user. The graph runs five nodes in sequence: intent planner, primary LLM, verifier, formatter, and fallback. The verifier independently checks whether the primary response actually answers the question and triggers automatic retries on failure.
+
+See [Verification graph](#verification-graph) for full details.
+
 ### Deterministic query planning
 
-The app now includes a `QueryPlanner` that analyzes prompts and routes them to the right tool chain before using the LLM.
+The app includes a `QueryPlanner` that analyzes prompts and routes them to the right tool chain before using the LLM.
 
 - Multi-step queries such as PSM report checks, department report checks, and code-history lookups are handled end-to-end.
 - The planner can chain tools like `locations_by_psm` → `hardcode_query`, or `search_loc_cd_history` → `check_reports`.
-- It preserves simplicity for direct code lookups and simple name searches while still supporting more complex flows.
 
 ### Dynamic quick prompt buttons
 
-Quick prompt buttons are auto-generated from tool definitions in `MCPClientService`. Adding a new tool
-automatically creates a matching button in the UI with no frontend code changes required.
+Quick prompt buttons are auto-generated from tool definitions in `MCPClientService`. Adding a new tool automatically creates a matching button in the UI.
 
 ### Keyword extraction and hybrid routing
 
-`OllamaService` now extracts normalized keywords from the user prompt and passes them to `QueryPlanner`.
-This enables deterministic plans for common phrases, tools, and locations while still allowing the LLM to
-handle ambiguous or conversational queries.
+`OllamaService` extracts normalized keywords from the user prompt and passes them to `QueryPlanner`, enabling deterministic plans for common phrases while still allowing the LLM to handle ambiguous queries.
 
 ### SQL-driven fallback and intent detection
 
-The app can detect `SQL_QUERY` intents and attempt direct SQL generation before entering the full agent loop.
-This gives a faster path for exact database questions, with a robust fallback to tool-based reasoning if needed.
+The app detects `SQL_QUERY` intents and attempts direct SQL generation before entering the full agent loop.
 
 ### Session memory and follow-up queries
 
-Session memory is stored per HTTP session so users can provide a list of codes once and ask follow-ups like
-"which have BSI report" or "how about KAI?" without retyping all codes.
+Session memory is stored per HTTP session so users can provide a list of codes once and ask follow-ups like "which have BSI report" without retyping all codes.
 
 ### Slope and specialized report handling
 
-The location detail flow now detects slope locations and returns slope-specific report groups plus TMCP/TMIS data,
-while non-slope lookups still return BSI/CSR/KAI/EMMS/DSSR report links.
+The location detail flow detects slope locations and returns slope-specific report groups plus TMCP/TMIS data.
 
 ### Expanded tool coverage
 
-New Ollama tools now support:
-
-- `locations_by_dept` — lookup locations by department code (`AFCD`, `LCSD`, `HD`, `DSD`, etc.).
+- `locations_by_dept` — lookup locations by department code.
 - `search_declared_monument` — find declared monuments, non-monuments, or both.
 - `search_historic_building` — find historic buildings by grade.
 - `search_loc_cd_history` — lookup former/current location code history.
 
-These tools extend the assistant beyond pure location search and report discovery.
+### Automatic former-code detection and redirect
 
-### TMCP / TMIS reports (slope monitoring)
+When searching location code history, the app automatically detects whether the searched code is a former (old) code or the current code by comparing the searched code against the `CURRENT_LOC_CD` values returned from the database.
 
-The app recognizes TMCP and TMIS links for slope locations and returns them as clickable URLs in agent
-responses. These are surfaced alongside existing report types (BSI, CSR, KAI, DSSR, EMMS).
+- If the searched code is **not** in the current codes list → it is a former code → `hardcode_query` is auto-triggered for the current code and full location details are appended below the history table.
+- If the searched code **is** the current code → history is shown as-is with no auto-trigger.
+- No extra prompt or flag is needed. The detection is automatic on every `CODE_HISTORY` query.
 
-### PSM lookup and location-by-PSM support
-
-The assistant can list distinct PSM values and return locations under a specific PSM using Ollama tool calls.
-
-### Quick usage examples
-
-Natural-language prompts:
+Example:
 
 ```
-show TMCP reports for SB04400361000
+User: "Search location code history for UD04400253000"
+  → DB returns: FORMER=UD04400253000, CURRENT=UC04400251000
+  → UD04400253000 not in currentCodes → auto-trigger hardcode_query(UC04400251000)
+  → Shows history table + full details of UC04400251000
 ```
-
-```
-show all PSMs
-```
-
-```
-which locations belong to PSM/SHA TIN EAST
-```
-
-```
-show locations for department AFCD
-```
-
-```
-find declared monuments
-```
-
-Chat endpoint example:
-
-```json
-{ "prompt": "Which locations have TMIS reports for Sha Tin Park?" }
-```
-
-Additional example prompts:
-
-- `list all slopes for department CLP from 2019 to 2024`
-- `show locations for department AFCD`
-- `find declared monuments`
-
-> Note: there is currently no dedicated `/api/location/search?psm=...` REST endpoint. PSM exploration is
-> supported via the chat agent using `list_psms` and `locations_by_psm` tool behavior.
 
 ---
 
@@ -1051,14 +1008,11 @@ Additional example prompts:
 
 **Symptom:**
 
-```text
+```
 java.security.KeyStoreException: problem accessing trust store
 okhttp3.OkHttpClient.<init>
 com.ais.service.OllamaService.<init>
 ```
-
-**Cause:** The production server's JVM truststore (`cacerts`) is corrupted, locked, or has a non-default
-password. OkHttp tries to load it during `OkHttpClient` construction.
 
 **Fix:** Build `OkHttpClient` with a trust-all SSL context in `OllamaService`:
 
@@ -1076,7 +1030,6 @@ private OkHttpClient buildHttpClient() {
         };
         SSLContext sslContext = SSLContext.getInstance("TLS");
         sslContext.init(null, trustAllCerts, new SecureRandom());
-
         return new OkHttpClient.Builder()
             .sslSocketFactory(sslContext.getSocketFactory(),
                               (X509TrustManager) trustAllCerts[0])
@@ -1086,43 +1039,59 @@ private OkHttpClient buildHttpClient() {
             .writeTimeout(30, TimeUnit.SECONDS)
             .build();
     } catch (Exception e) {
-        log.error("SSL bypass failed, using plain client: {}", e.getMessage());
+        log.error("SSL bypass failed: {}", e.getMessage());
         return new OkHttpClient.Builder()
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(300, TimeUnit.SECONDS)
-            .writeTimeout(30, TimeUnit.SECONDS)
             .build();
     }
 }
 ```
 
-This is safe because Ollama runs on `localhost` and does not require certificate validation.
+### Verifier always auto-approves
 
----
+**Symptom:** Logs show `Verification service unavailable - auto-approved` on every request.
+
+**Cause:** `ollama.base_url` in `application.properties` points to the wrong host or port.
+
+**Fix:** Confirm Ollama is reachable:
+
+```bash
+curl http://<ollama-ip>:11434/api/tags
+```
+
+Then set the correct URL in `application.properties`:
+
+```properties
+ollama.base_url=http://192.168.1.234:11434
+```
+
+### Verifier adds latency
+
+**Symptom:** Each request takes 4–8 seconds longer than before.
+
+**Cause:** The verifier makes a second Ollama call for every response.
+
+**Options:**
+
+- Use a smaller/faster model for verification: `ollama.verifier.model=phi3:mini`
+- Reduce verifier context: `num_ctx=512` (already set in `VerifierNode`)
+- Disable verification for development: set `graph.verification.enabled=false`
 
 ### Duplicate location code / private owner confusion
 
-- `LOC_CD` can appear multiple times in historical data.
-- Queries that use `locCd` may return the current row by default, while private-owner or historical records
-  may require additional filtering in the prompt.
-- The app uses `SearchScreen` style text matching and schema inspection to choose the most likely row.
+`LOC_CD` can appear multiple times in historical data. Queries may return the current row by default.
 
 ### Department and private-owner data gaps
 
-- `locations_by_dept` supports common department codes like `AFCD`, `LCSD`, `HD`, and `DSD`.
-- If a department has no rows in the source schema, the planner may fall back to broader category searches.
-- Private owner records are only available when present in the `A_GENERAL_INFO` and related location tables.
-
-### Building year and report metadata mismatch
-
-- Some locations have `BUILD_YEAR` or report dates that do not match the physical inspection year.
-- The planner preserves the source data and reports this discrepancy in the generated answer when detected.
+`locations_by_dept` supports common codes (`AFCD`, `LCSD`, `HD`, `DSD`). If a department has no rows the planner may fall back to broader searches.
 
 ---
 
 ## Notes
 
-- The project expects the database schema to contain location data in the `ais` schema.
-- The assistant relies on both the SQL Server data source and the Ollama service to produce answers.
-- If your environment differs, update `src/main/resources/application.properties` and the Ollama settings
-  before running the app.
+- The project expects location data in the `ais` schema of SQL Server.
+- The assistant relies on both the SQL Server data source and the Ollama service.
+- The verification graph is compiled once at `ChatServlet.init()` and reused for all requests.
+- If `ollama.verifier.model` is not set, it defaults to the same model as `ollama.model`.
+- Update `src/main/resources/application.properties` before running in a new environment.
