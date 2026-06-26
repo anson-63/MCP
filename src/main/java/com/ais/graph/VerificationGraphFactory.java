@@ -31,37 +31,8 @@ public class VerificationGraphFactory {
         FormatterNode  formatter  = new FormatterNode();
         FallbackNode   fallback   = new FallbackNode();
 
-        GraphEdge verifierRouter = state -> {
-            GraphState.VerificationResult result = state.getVerificationResult();
-
-            switch (result) {
-
-                case APPROVED:
-                    // ── Clean pass ─────────────────────────────────
-                    log.info("[Router] APPROVED → formatter");
-                    return "formatter";
-
-                case RETRY:
-                    if (state.canRetry()) {
-                        state.incrementRetry();
-                        log.info("[Router] RETRY → primary_llm (attempt {}/{})",
-                            state.getRetryCount() + 1, GraphState.MAX_RETRIES);
-                        return "primary_llm";
-                    }
-                    // Max retries: show answer + warning banner
-                    log.warn("[Router] Max retries exhausted → formatter (with warning)");
-                    return "formatter";
-
-                case REJECTED:
-                    // Show answer in collapsible "unverified" section
-                    log.warn("[Router] REJECTED → fallback (shows answer with warning)");
-                    return "fallback";
-
-                default:
-                    log.warn("[Router] Unknown result {} → formatter", result);
-                    return "formatter";
-            }
-        };
+        // ── Use named class instead of lambda to avoid $1 classloading issue ──
+        GraphEdge verifierRouter = new VerifierRouter();
 
         return new AgentGraph()
             .addNode("planner",     planner)
@@ -74,5 +45,47 @@ public class VerificationGraphFactory {
             .addConditionalEdge("verifier", verifierRouter)
             .setEntryPoint("planner")
             .compile();
+    }
+
+    /**
+     * Named static inner class instead of lambda.
+     * Avoids ClassNotFoundException for anonymous $1 class in Tomcat classloader.
+     */
+    public static class VerifierRouter implements GraphEdge {
+
+        private static final Logger log =
+            LoggerFactory.getLogger(VerifierRouter.class);
+
+        @Override
+        public String route(GraphState state) {
+            GraphState.VerificationResult result = state.getVerificationResult();
+
+            if (result == GraphState.VerificationResult.APPROVED) {
+                log.info("[Router] APPROVED → formatter");
+                return "formatter";
+            }
+
+            if (result == GraphState.VerificationResult.RETRY) {
+                if (state.canRetry()) {
+                    state.incrementRetry();
+                    log.info("[Router] RETRY → primary_llm (attempt {}/{})",
+                        state.getRetryCount() + 1,
+                        GraphState.MAX_RETRIES);
+                    return "primary_llm";
+                }
+                log.warn("[Router] Max retries ({}) exhausted → formatter (best effort)",
+                    state.getRetryCount());
+                return "formatter";
+            }
+
+            if (result == GraphState.VerificationResult.REJECTED) {
+                log.warn("[Router] REJECTED → fallback. Reason={}",
+                    state.getVerificationReason());
+                return "fallback";
+            }
+
+            log.warn("[Router] Unknown result {} → formatter", result);
+            return "formatter";
+        }
     }
 }

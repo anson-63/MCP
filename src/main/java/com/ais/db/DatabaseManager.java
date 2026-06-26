@@ -69,43 +69,63 @@ public class DatabaseManager {
 
     // ── Location query ──────────────────────────────────────────────
     public Map<String, Object> getGeneralInfo(String locCd) {
-        String sql = "SELECT * FROM ais.A_GENERAL_INFO WHERE LOC_CD = ?";
+        Map<String, Object> result = new LinkedHashMap<String, Object>();
+        if (locCd == null || locCd.trim().isEmpty()) {
+            return result;
+        }
+        locCd = locCd.trim().toUpperCase();
 
         Connection conn = null;
-        PreparedStatement ps = null;
-        ResultSet rs = null;
-        
+        PreparedStatement psHistory = null;
+        PreparedStatement psMain = null;
+        ResultSet rsHistory = null;
+        ResultSet rsMain = null;
+
         try {
             conn = getConnection();
-            ps = conn.prepareStatement(sql);
-            ps.setString(1, locCd);
-            rs = ps.executeQuery();
+
+            // ── 1. AUTOMATIC FORMER-TO-CURRENT CODE REDIRECT ──
+            // If the user requested a former code, automatically resolve its active current code!
+            String checkHistorySql = "SELECT TOP 1 CURRENT_LOC_CD FROM ais.A_LOC_CD_CHANGE_HISTORY "
+                    + "WHERE UPPER(FORMER_LOC_CD) = ? AND UPPER(CURRENT_LOC_CD) != UPPER(FORMER_LOC_CD) "
+                    + "ORDER BY CURRENT_LOC_CD DESC";
             
-            ResultSetMetaData meta = rs.getMetaData();
+            psHistory = conn.prepareStatement(checkHistorySql);
+            psHistory.setString(1, locCd);
+            rsHistory = psHistory.executeQuery();
+
+            if (rsHistory.next()) {
+                String currentLocCd = rsHistory.getString("CURRENT_LOC_CD").trim().toUpperCase();
+                if (!currentLocCd.isEmpty()) {
+                    log.info("🔄 Auto-Redirect: Former code '{}' detected. Querying active CURRENT_LOC_CD: '{}'", locCd, currentLocCd);
+                    locCd = currentLocCd; // Override locCd with the active current code!
+                }
+            }
+            closeQuietly(rsHistory, psHistory, null);
+
+            // ── 2. EXECUTE MAIN GENERAL INFO QUERY USING THE ACTIVE CODE ──
+            String mainSql = "SELECT * FROM ais.A_GENERAL_INFO WHERE UPPER(LOC_CD) = ?";
+            psMain = conn.prepareStatement(mainSql);
+            psMain.setString(1, locCd);
+            rsMain = psMain.executeQuery();
+
+            ResultSetMetaData meta = rsMain.getMetaData();
             int cols = meta.getColumnCount();
 
-            if (rs.next()) {
-                Map<String, Object> row = new LinkedHashMap<String, Object>();
+            if (rsMain.next()) {
                 for (int i = 1; i <= cols; i++) {
-                    row.put(meta.getColumnName(i), rs.getObject(i));
+                    result.put(meta.getColumnName(i), rsMain.getObject(i));
                 }
-                return row;
             }
 
-            Map<String, Object> notFound = new HashMap<String, Object>();
-            notFound.put("error", "Not found");
-            return notFound;
-
         } catch (SQLException e) {
-            log.error("DB error: {}", e.getMessage());
-            Map<String, Object> error = new HashMap<String, Object>();
-            error.put("error", e.getMessage());
-            return error;
+            log.error("Error executing getGeneralInfo for {}: {}", locCd, e.getMessage());
         } finally {
-            try { if (rs != null) rs.close(); } catch (Exception ignored) {}
-            try { if (ps != null) ps.close(); } catch (Exception ignored) {}
-            try { if (conn != null) conn.close(); } catch (Exception ignored) {}
+            closeQuietly(rsMain, psMain, null);
+            closeQuietly(rsHistory, psHistory, conn);
         }
+
+        return result;
     }
 
     // ── Introspect schema ────────────────────────────────────────────
@@ -179,35 +199,38 @@ public class DatabaseManager {
         if (general.containsKey("error")) {
             return fullInfo;
         }
-        
-        // ── Detect slope location ────────────────────────────────────
-        String locName = general.get("LOC_NAME") != null 
+
+        // ── Heritage info — always fetch for any location ─────────────────
+        String historicGrade   = getHistoricGradeForCode(locCd);
+        String monumentStatus  = getDeclaredMonumentStatus(locCd);
+        fullInfo.put("historicGrade",  historicGrade);   // null if not graded
+        fullInfo.put("isMonument",     "T".equals(monumentStatus));
+
+        // ── Slope detection ───────────────────────────────────────────────
+        String locName = general.get("LOC_NAME") != null
                        ? general.get("LOC_NAME").toString() : "";
         boolean isSlope = isSlopeLocation(locName);
         fullInfo.put("isSlope", isSlope);
-        
+
         if (isSlope) {
-            // ── SLOPE: only slope-specific reports ───────────────────
-            log.info("🏔️ Slope location detected: {} ({})", locName, locCd);
-            
             Map<String, Object> slopeData = getSlopeReports(locCd);
             fullInfo.put("slopeReports", slopeData.get("slopeReports"));
             fullInfo.put("tmcpForms",    slopeData.get("tmcpForms"));
-            
-            // ⚠️ NO standard reports for slopes
-            
         } else {
-            // ── NON-SLOPE: standard reports only ─────────────────────
             List<Map<String, Object>> reports = new ArrayList<Map<String, Object>>();
-            reports.add(getReport(locCd, "Building Safety Inspection (BSIR)",      "ais.BSI_GENERAL_INFO",            "BLDG_SAFETY_INSP_REPORT_NO", "BSI"));
-            reports.add(getReport(locCd, "Condition Survey by Contractor (CSR)",   "ais.CS_PLAN",                     "FILE_PATH_AUTOCAD",          "CSR"));
-            reports.add(getReport(locCd, "Key Asset Information (KAI)",            "ais.KAI_RECORD_PLANS_AND_DRAWINGS","AUTOCAD_PATH",              "KAI"));
-            reports.add(getReport(locCd, "EMMS",                                   "ais.OLD_EMMS",                    "REPORT_LINK",                "EMMS"));
-            reports.add(getReport(locCd, "Detailed Survey Summary (DSSR)",         "ais.DSSR_REPORT",                 "REPORT_NO",                  "DSSR"));
-            
+            reports.add(getReport(locCd, "Building Safety Inspection (BSIR)",
+                    "ais.BSI_GENERAL_INFO", "BLDG_SAFETY_INSP_REPORT_NO", "BSI"));
+            reports.add(getReport(locCd, "Condition Survey by Contractor (CSR)",
+                    "ais.CS_PLAN", "FILE_PATH_AUTOCAD", "CSR"));
+            reports.add(getReport(locCd, "Key Asset Information (KAI)",
+                    "ais.KAI_RECORD_PLANS_AND_DRAWINGS", "AUTOCAD_PATH", "KAI"));
+            reports.add(getReport(locCd, "EMMS",
+                    "ais.OLD_EMMS", "REPORT_LINK", "EMMS"));
+            reports.add(getReport(locCd, "Detailed Survey Summary (DSSR)",
+                    "ais.DSSR_REPORT", "REPORT_NO", "DSSR"));
             fullInfo.put("reports", reports);
         }
-        
+
         return fullInfo;
     }
     
@@ -219,13 +242,13 @@ public class DatabaseManager {
             
             // BSI: "AIS/BSI/bsiReport.jsp?reportno=" + BLDGSAFETY_INSP_REPORT_NO
             case "BSI": {
-                String serverUrl = "domain"; //hardcode report server base URL
+                String serverUrl = "https://domain/"; //hardcode report server base URL
                 return serverUrl + "AIS/BSI/bsiReport.jsp?reportno=" + reportId.trim();
             }
             
             // CSR: "AIS_SP/SPServlet?name=downloadFile&path=attachments/CS" + FILE_PATH_AUTOCAD
             case "CSR": {
-                String serverUrl = "domain"; //hardcode report server base URL
+                String serverUrl = "https://domain/"; //hardcode report server base URL
                 return serverUrl + "AIS_SP/SPServlet?name=downloadFile&path=attachments/CS"
                        + reportId.trim();
             }
@@ -233,7 +256,7 @@ public class DatabaseManager {
             // KAI: Server_URL + "ReportGetFileServlet?reportType=KAI&mode=attachment
             //      &locCd=" + locCd + "&filename=" + AUTOCAD_PATH
             case "KAI": {
-                String serverUrl = "domain"; //hardcode report server base URL
+                String serverUrl = "https://domain/"; //hardcode report server base URL
                 return serverUrl + "ReportGetFileServlet"
                        + "?reportType=KAI"
                        + "&mode=attachment"
@@ -871,7 +894,7 @@ public class DatabaseManager {
 	     switch (urlSource) {
 	         
 	         // ── TMIS: \attachment\Form1\SA0852_20190722.pdf ─────────
-	         //   → "domain"/AIS/ReportGetFileServlet
+	         //   → https://domain/AIS/ReportGetFileServlet
 	         //     ?reportType=Form1&filename=SA0852_20190722
 	         case "TMIS": {
 	             String filename = extractTmisFilename(rawLink);
@@ -879,7 +902,7 @@ public class DatabaseManager {
 	                 log.warn("Cannot extract filename from TMIS link: {}", rawLink);
 	                 return null;
 	             }
-	             return "domain/AIS/ReportGetFileServlet"
+	             return "https://domain/AIS/ReportGetFileServlet"
 	                  + "?reportType=" + formType
 	                  + "&filename=" + filename;
 	         }
@@ -889,21 +912,21 @@ public class DatabaseManager {
 	             // If stored as a filename, use AIS servlet
 	             String filename = extractTmisFilename(rawLink);
 	             if (filename != null) {
-	                 return "domain/AIS/ReportGetFileServlet"
+	                 return "https://domain/AIS/ReportGetFileServlet"
 	                      + "?reportType=" + formType
 	                      + "&filename=" + filename;
 	             }
 	             // Fallback: treat as raw filename
-	             return "domain/AIS/ReportGetFileServlet"
+	             return "https://domain/AIS/ReportGetFileServlet"
 	                  + "?reportType=" + formType
 	                  + "&filename=" + rawLink;
 	         }
 	         
 	         // ── TMCP_NEW: GUID-style id ─────────────────────────────
-	         //   → http://www.tcb929.com/ASD_Slope/AIS/downloadreport.aspx
+	         //   → http://domain/ASD_Slope/AIS/downloadreport.aspx
 	         //     ?Worktype=Form1&id=7842BA8F-568F-4520-980F-FA5E7A950509
 	         case "TMCP_NEW": {
-	             return "http://www.tcb929.com/ASD_Slope/AIS/downloadreport.aspx"
+	             return "http://domain/ASD_Slope/AIS/downloadreport.aspx"
 	                  + "?Worktype=" + formType
 	                  + "&id=" + rawLink;
 	         }
@@ -1001,18 +1024,56 @@ public class DatabaseManager {
 
 	 // ── Get locations under a specific PSM ──────────────────────────
 	 public List<Map<String, Object>> getLocationsByPsm(String psm, String location) {
-		    log.info("Locations by PSM: psm={} location={}", psm, location);
+	        List<Map<String, Object>> results = new ArrayList<Map<String, Object>>();
 
-		    return executeLocationQuery(
-		        new LocationQuery()
-		            .table("ais.A_GENERAL_INFO", "g")
-		            .select("g.LOC_CD", "g.LOC_NAME", "g.ADDRESS")
-		            .where("LTRIM(RTRIM(g.PSM)) = LTRIM(RTRIM(?))", psm)
-		            .location(location)
-		            .orderBy("LOC_NAME")
-		            .limit(50)
-		    );
-		}
+	        if (psm == null || psm.trim().isEmpty()) {
+	            return results;
+	        }
+
+	        Connection conn = null;
+	        PreparedStatement ps = null;
+	        ResultSet rs = null;
+
+	        try {
+	            conn = getConnection();
+	            
+	            // ── 1. USE ROBUST UPPER(PSM) LIKE ? TO CATCH "PSM/KT" AND TRAILING SPACES ──
+	            StringBuilder sql = new StringBuilder("SELECT TOP 50 g.LOC_CD, g.LOC_NAME, g.ADDRESS FROM ais.A_GENERAL_INFO g WHERE UPPER(g.PSM) LIKE ?");
+	            if (location != null && !location.trim().isEmpty()) {
+	                sql.append(" AND (UPPER(g.LOC_NAME) LIKE ? OR UPPER(g.ADDRESS) LIKE ?)");
+	            }
+	            sql.append(" ORDER BY g.LOC_NAME");
+
+	            ps = conn.prepareStatement(sql.toString());
+	            
+	            // Wrap psm parameter with wildcards e.g. "%KT%"
+	            ps.setString(1, "%" + psm.trim().toUpperCase() + "%");
+	            
+	            if (location != null && !location.trim().isEmpty()) {
+	                String locParam = "%" + location.trim().toUpperCase() + "%";
+	                ps.setString(2, locParam);
+	                ps.setString(3, locParam);
+	            }
+
+	            rs = ps.executeQuery();
+	            while (rs.next()) {
+	                Map<String, Object> row = new LinkedHashMap<String, Object>();
+	                row.put("LOC_CD", rs.getString("LOC_CD"));
+	                row.put("LOC_NAME", rs.getString("LOC_NAME"));
+	                row.put("ADDRESS", rs.getString("ADDRESS"));
+	                results.add(row);
+	            }
+
+	            log.info("Found {} locations for PSM: {}", results.size(), psm);
+
+	        } catch (SQLException e) {
+	            log.error("Error executing getLocationsByPsm for {}: {}", psm, e.getMessage());
+	        } finally {
+	            closeQuietly(rs, ps, conn);
+	        }
+
+	        return results;
+	    }
 
 		// Keep old signature
 		public List<Map<String, Object>> getLocationsByPsm(String psm) {
@@ -1097,9 +1158,32 @@ public class DatabaseManager {
 		        return new ArrayList<Map<String, Object>>();
 		    }
 
-		    log.info("Historic buildings: grade={} location={}", grade, location);
+		    // ── Sanitize grade at DB boundary ─────────────────────────────────
+		    String safeGrade = sanitizeGradeForDb(grade);
+		    log.info("Historic buildings: grade={} (raw={}) location={}", safeGrade, grade, location);
 
-		    return executeHistoricBuildingQuery(grade, location, gisDb);
+		    return executeHistoricBuildingQuery(safeGrade, location, gisDb);
+		}
+
+		/**
+		 * DB-level grade sanitizer — last line of defense.
+		 * Converts any LLM-hallucinated value to a safe DB-query value.
+		 */
+		private String sanitizeGradeForDb(String grade) {
+		    if (grade == null || grade.trim().isEmpty()) return "ALL";
+
+		    String g = grade.trim().toUpperCase();
+
+		    // Valid values — pass through
+		    switch (g) {
+		        case "1": case "2": case "3":
+		        case "ALL": case "NONE": case "0":
+		        case "GRADED":
+		            return g;
+		        default:
+		            log.warn("⚠️ DB sanitizer: invalid grade '{}' → ALL", grade);
+		            return "ALL";
+		    }
 		}
 
 		// Keep old signature
@@ -1409,27 +1493,31 @@ public class DatabaseManager {
 	    StringBuilder sql = new StringBuilder();
 	    List<Object> params = new ArrayList<Object>();
 
+	    // Use subquery to deduplicate — one row per LOC_CD
 	    sql.append("SELECT TOP 50 ")
 	       .append("c.LOC_CD, g.LOC_NAME, g.ADDRESS, c.DECLR_MONUMT ")
-	       .append("FROM ").append(gisDb).append(".sde.T_ASD_COMBINED c ")
+	       .append("FROM ( ")
+	       .append("  SELECT LOC_CD, MAX(DECLR_MONUMT) AS DECLR_MONUMT ")
+	       .append("  FROM ").append(gisDb).append(".sde.T_ASD_COMBINED ")
+	       .append("  GROUP BY LOC_CD ")
+	       .append(") c ")
 	       .append("LEFT JOIN ais.A_GENERAL_INFO g ON c.LOC_CD = g.LOC_CD ")
 	       .append("WHERE 1=1 ");
 
-	    // Monument filter
 	    if ("T".equals(filter)) {
-	        sql.append("AND UPPER(c.DECLR_MONUMT) = 'T' ");
+	        sql.append("AND UPPER(LTRIM(RTRIM(c.DECLR_MONUMT))) = 'T' ");
 	    } else if ("F".equals(filter)) {
-	        sql.append("AND (UPPER(c.DECLR_MONUMT) = 'F' OR c.DECLR_MONUMT IS NULL) ");
+	        sql.append("AND (UPPER(LTRIM(RTRIM(c.DECLR_MONUMT))) = 'F' ")
+	           .append("OR c.DECLR_MONUMT IS NULL) ");
 	    }
 
-	    // Universal location filter
 	    appendLocationFilter(sql, params, "g", location);
-
 	    sql.append("ORDER BY g.LOC_NAME");
 
-	    log.info("Found X declared monuments (filter={}, location={})", filter, location);
-
-	    return executeRawQuery(sql.toString(), params);
+	    List<Map<String, Object>> results = executeRawQuery(sql.toString(), params);
+	    log.info("Found {} declared monuments (filter={}, location={})",
+	            results.size(), filter, location);
+	    return results;
 	}
 
 	// ── Historic buildings (GIS-primary join) ────────────────────────
@@ -1439,32 +1527,25 @@ public class DatabaseManager {
 	    StringBuilder sql = new StringBuilder();
 	    List<Object> params = new ArrayList<Object>();
 
+	    // Deduplicate GIS table first — one row per LOC_CD
 	    sql.append("SELECT TOP 50 ")
 	       .append("c.LOC_CD, g.LOC_NAME, g.ADDRESS, c.GRD_HIST_BLDG ")
-	       .append("FROM ").append(gisDb).append(".sde.T_ASD_COMBINED c ")
+	       .append("FROM ( ")
+	       .append("  SELECT LOC_CD, MAX(GRD_HIST_BLDG) AS GRD_HIST_BLDG ")
+	       .append("  FROM ").append(gisDb).append(".sde.T_ASD_COMBINED ")
+	       .append("  GROUP BY LOC_CD ")
+	       .append(") c ")
 	       .append("LEFT JOIN ais.A_GENERAL_INFO g ON c.LOC_CD = g.LOC_CD ")
 	       .append("WHERE 1=1 ");
 
-	    // Grade filter
-	    if ("0".equals(grade) || "NONE".equals(grade)) {
-	        sql.append("AND (c.GRD_HIST_BLDG = '0' OR c.GRD_HIST_BLDG IS NULL) ");
-	    } else if ("ALL".equals(grade)) {
-	        sql.append("AND c.GRD_HIST_BLDG IS NOT NULL ")
-	           .append("AND c.GRD_HIST_BLDG <> '0' ")
-	           .append("AND LTRIM(RTRIM(c.GRD_HIST_BLDG)) <> '' ");
-	    } else if ("1".equals(grade) || "2".equals(grade) || "3".equals(grade)) {
-	        sql.append("AND c.GRD_HIST_BLDG = ? ");
-	        params.add(grade);
-	    }
-
-	    // Universal location filter
+	    appendGradeFilter(sql, params, grade);
 	    appendLocationFilter(sql, params, "g", location);
-
 	    sql.append("ORDER BY g.LOC_NAME");
 
-	    log.info("Found X historic buildings (grade={}, location={})", grade, location);
-
-	    return executeRawQuery(sql.toString(), params);
+	    List<Map<String, Object>> results = executeRawQuery(sql.toString(), params);
+	    log.info("Found {} historic buildings (grade={}, location={})",
+	            results.size(), grade, location);
+	    return results;
 	}
 
 	// ── Append location filter to any SQL ────────────────────────────
@@ -1624,5 +1705,141 @@ public class DatabaseManager {
 	    }
 
 	    return response;
+	}
+	
+	/**
+	 * Appends a grade filter clause to any SQL builder.
+	 * Supports: null/ALL (any graded), 1/2/3 (specific), 
+	 *           NONE/0 (ungraded), GRADED (has any grade)
+	 * Scalable: add new grade values here only.
+	 */
+	private void appendGradeFilter(StringBuilder sql,
+	        List<Object> params, String grade) {
+
+	    if (grade == null || grade.trim().isEmpty()) {
+	        // No filter at all — return everything including ungraded
+	        return;
+	    }
+
+	    String g = grade.trim().toUpperCase();
+
+	    switch (g) {
+	        case "ALL":
+	            // Any non-null, non-empty, non-zero grade
+	            sql.append("AND c.GRD_HIST_BLDG IS NOT NULL ")
+	               .append("AND LTRIM(RTRIM(c.GRD_HIST_BLDG)) <> '' ")
+	               .append("AND LTRIM(RTRIM(c.GRD_HIST_BLDG)) <> '0' ");
+	            break;
+
+	        case "GRADED":
+	            // Same as ALL — user said "not null" / "has grade"
+	            sql.append("AND c.GRD_HIST_BLDG IS NOT NULL ")
+	               .append("AND LTRIM(RTRIM(c.GRD_HIST_BLDG)) <> '' ")
+	               .append("AND LTRIM(RTRIM(c.GRD_HIST_BLDG)) <> '0' ");
+	            break;
+
+	        case "0":
+	        case "NONE":
+	            // Explicitly ungraded
+	            sql.append("AND (c.GRD_HIST_BLDG IS NULL ")
+	               .append("OR LTRIM(RTRIM(c.GRD_HIST_BLDG)) = '' ")
+	               .append("OR LTRIM(RTRIM(c.GRD_HIST_BLDG)) = '0') ");
+	            break;
+
+	        case "1":
+	        case "2":
+	        case "3":
+	            // Specific grade
+	            sql.append("AND LTRIM(RTRIM(c.GRD_HIST_BLDG)) = ? ");
+	            params.add(g);
+	            break;
+
+	        default:
+	            // Unknown grade value — log and skip filter
+	            log.warn("⚠️ Unknown grade filter '{}' — returning all graded", grade);
+	            sql.append("AND c.GRD_HIST_BLDG IS NOT NULL ")
+	               .append("AND LTRIM(RTRIM(c.GRD_HIST_BLDG)) <> '' ");
+	            break;
+	    }
+	}
+	
+	/**
+	 * Get historic grade for a specific location code.
+	 * Returns the grade string or null if not found.
+	 */
+	public String getHistoricGradeForCode(String locCd) {
+	    String gisDb = AppConfig.GISdbName();
+	    if (gisDb.isEmpty()) {
+	        log.error("GIS DB NAME not configured");
+	        return null;
+	    }
+
+	    String sql = "SELECT TOP 1 GRD_HIST_BLDG "
+	               + "FROM " + gisDb + ".sde.T_ASD_COMBINED "
+	               + "WHERE LOC_CD = ? "
+	               + "AND GRD_HIST_BLDG IS NOT NULL "
+	               + "AND LTRIM(RTRIM(GRD_HIST_BLDG)) <> '' "
+	               + "AND LTRIM(RTRIM(GRD_HIST_BLDG)) <> '0' "
+	               + "ORDER BY GRD_HIST_BLDG";
+
+	    Connection conn = null;
+	    PreparedStatement ps = null;
+	    ResultSet rs = null;
+
+	    try {
+	        conn = getConnection();
+	        ps = conn.prepareStatement(sql);
+	        ps.setString(1, locCd.trim().toUpperCase());
+	        rs = ps.executeQuery();
+
+	        if (rs.next()) {
+	            String grade = rs.getString("GRD_HIST_BLDG");
+	            log.info("Historic grade for {}: {}", locCd, grade);
+	            return grade != null ? grade.trim() : null;
+	        }
+
+	        log.info("No historic grade found for {}", locCd);
+	        return null;
+
+	    } catch (SQLException e) {
+	        log.error("getHistoricGradeForCode error for {}: {}", locCd, e.getMessage());
+	        return null;
+	    } finally {
+	        closeQuietly(rs, ps, conn);
+	    }
+	}
+
+	/**
+	 * Get declared monument status for a specific location code.
+	 */
+	public String getDeclaredMonumentStatus(String locCd) {
+	    String gisDb = AppConfig.GISdbName();
+	    if (gisDb.isEmpty()) return null;
+
+	    String sql = "SELECT TOP 1 DECLR_MONUMT "
+	               + "FROM " + gisDb + ".sde.T_ASD_COMBINED "
+	               + "WHERE LOC_CD = ?";
+
+	    Connection conn = null;
+	    PreparedStatement ps = null;
+	    ResultSet rs = null;
+
+	    try {
+	        conn = getConnection();
+	        ps = conn.prepareStatement(sql);
+	        ps.setString(1, locCd.trim().toUpperCase());
+	        rs = ps.executeQuery();
+
+	        if (rs.next()) {
+	            return rs.getString("DECLR_MONUMT");
+	        }
+	        return null;
+
+	    } catch (SQLException e) {
+	        log.error("getDeclaredMonumentStatus error: {}", e.getMessage());
+	        return null;
+	    } finally {
+	        closeQuietly(rs, ps, conn);
+	    }
 	}
 }
