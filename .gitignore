@@ -37,3 +37,5 @@ src/main/webapp/WEB-INF/lib/
 *~
 *.bak
 *.swp
+
+src/main/java/tools
