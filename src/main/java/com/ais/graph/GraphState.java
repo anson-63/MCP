@@ -35,6 +35,7 @@ public class GraphState {
     private String primaryResponse;
     private List<String> toolCallsMade = new ArrayList<>();
     private String rawToolOutput;
+    private List<Map<String, Object>> toolCallDetails = new ArrayList<>();
 
     // ── Verification ──────────────────────────────────────────
     private VerificationResult verificationResult = VerificationResult.SKIPPED;
@@ -104,6 +105,14 @@ public class GraphState {
     public String getRawToolOutput() { return rawToolOutput; }
     public void setRawToolOutput(String rawToolOutput) { 
         this.rawToolOutput = rawToolOutput; 
+    }
+    
+    public List<Map<String, Object>> getToolCallDetails() {
+        return toolCallDetails;
+    }
+
+    public void setToolCallDetails(List<Map<String, Object>> toolCallDetails) {
+        this.toolCallDetails = toolCallDetails;
     }
 
     public VerificationResult getVerificationResult() { return verificationResult; }

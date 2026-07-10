@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>ArcGIS - AIS Location Map</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="initial-scale=1, maximum-scale=1, user-scalable=no">
+    <link rel="stylesheet" href="https://js.arcgis.com/4.14/esri/css/main.css">
+    <script src="https://js.arcgis.com/4.14/"></script>
+    <style>
+        html,
+        body,
+        #viewDiv {
+            padding: 0;
+            margin: 0;
+            height: 100%;
+            width: 100%;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="viewDiv"></div>
+
+    <script>
+        require([
+            "esri/Map",
+            "esri/views/MapView",
+            "esri/widgets/Home",
+            "esri/layers/TileLayer",
+            "esri/layers/FeatureLayer",
+            "esri/layers/GraphicsLayer",
+            "esri/Graphic",
+            "esri/geometry/Polygon",
+            "dojo/domReady!"
+        ], function (Map, MapView, Home, TileLayer, FeatureLayer, GraphicsLayer, Graphic, Polygon) {
+
+            const urlParams = new URLSearchParams(window.location.search);
+            const locCd = urlParams.get('locCd');
+
+            const map = new Map();
+            const view = new MapView({
+                container: "viewDiv",
+                map: map
+            });
+
+            const homeBtn = new Home({ view: view });
+            view.ui.add(homeBtn, "top-left");
+
+            // Basemap layer
+            const basemapLayer = new TileLayer({
+                url: "https://domain/arcgis_server/rest/services/AIS_Basemap/MapServer"
+            });
+            map.add(basemapLayer);
+
+            // Asset layer
+            const assetLayer = new FeatureLayer({
+                url: "https://domain/arcgis_server/rest/services/ASSETMap/MapServer/2"
+            });
+            map.add(assetLayer);
+
+            const graphicsLayer = new GraphicsLayer();
+            map.add(graphicsLayer);
+
+            function drawPolygon(rings, extent) {
+                const polygon = new Polygon({
+                    rings: rings,
+                    spatialReference: { wkid: 102140 }
+                });
+
+                const graphic = new Graphic({
+                    geometry: polygon,
+                    symbol: {
+                        type: "simple-fill",
+                        color: [0, 0, 255, 0.5],
+                        outline: {
+                            color: [0, 0, 255, 1],
+                            width: 2
+                        }
+                    }
+                });
+
+                graphicsLayer.add(graphic);
+                view.goTo(polygon);
+            }
+			
+            // ── Notify the parent page (the chat window this file is embedded
+            // into via <iframe>) about the query outcome, so it can update the
+            // "View in AIS Asset Search" button that lives outside this iframe
+            // — e.g. relabel it "No feature" and strip its redirect link when
+            // this map couldn't find a matching feature either.
+            //
+            // postMessage is required here (rather than reaching into the
+            // parent DOM directly) because this file and the parent chat page
+            // are two separate documents loaded into an <iframe>; there is no
+            // other supported way for this script to touch the parent's DOM.
+            //
+            // targetOrigin uses window.location.origin, not "*": this assumes
+            // plugin.html and the chat page are always served from the same
+            // origin (same Tomcat webapp), matching how the app is deployed
+            // elsewhere (see AIS_Assistant README: both apps must share a
+            // server for the location-code deep links to work). If you ever
+            // embed this page cross-origin, this postMessage will silently
+            // fail to reach a parent on a different origin — update the
+            // targetOrigin accordingly.
+            function notifyParent(status, locCd) {
+                if (window.parent === window) return; // not embedded in an iframe
+                window.parent.postMessage({
+                    source: 'ais-plugin-map',
+                    status: status,   // 'ok' | 'no-feature' | 'error'
+                    locCd: locCd
+                }, window.location.origin);
+            }
+            
+            function queryLayer(locCd) {
+                if (!locCd) return;
+
+                const whereClause = `LOC_CD = '${locCd}'`;
+                const query = {
+                    where: whereClause,
+                    spatialRelationship: "intersects",
+                    returnGeometry: true,
+                    outFields: ["*"],
+                    outSpatialReference: { wkid: 102140 }
+                };
+
+                assetLayer.queryFeatures(query)
+                    .then(function (results) {
+                        if (results.features.length > 0) {
+                            const feature = results.features[0];
+                            drawPolygon(feature.geometry.rings, feature.geometry.extent);
+                        	notifyParent('ok', locCd);
+                        } else {
+                            console.warn("No feature found for LOC_CD:", locCd);
+                            notifyParent("no-feature", locCd);
+                        }
+                    })
+                    .catch(function (error) {
+                        console.error("Error querying layer:", error);
+                        notifyParent("error", locCd);
+                    });
+            }
+
+            // Auto-query if locCd is passed in URL
+            if (locCd) {
+                // Wait for layers to load before querying
+                view.whenLayerView(assetLayer).then(() => {
+                	queryLayer(locCd);
+                });
+            }
+        });
+    </script>
+</body>
+
+</html>

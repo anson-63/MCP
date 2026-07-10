@@ -28,12 +28,12 @@ public class ReportServlet extends HttpServlet {
     protected void doGet(HttpServletRequest req, HttpServletResponse resp)
             throws ServletException, IOException {
 
-        String type     = req.getParameter("type");
-        String locCd    = req.getParameter("locCd");
+        String type = req.getParameter("type");
+        String locCd = req.getParameter("locCd");
         String reportId = req.getParameter("reportId");
 
-        log.info("Report request: type={}, locCd={}, reportId={}", 
-                 type, locCd, reportId);
+        log.info("[Manual Info]Report request: type={}, locCd={}, reportId={}",
+                type, locCd, reportId);
 
         // Map type to table name
         String tableName = getTableName(type);
@@ -53,17 +53,23 @@ public class ReportServlet extends HttpServlet {
 
     private String getTableName(String type) {
         switch (type) {
-            case "survey":     return "ais.A_SURVEY_REPORT";
-            case "maintenance": return "ais.A_MAINT_REPORT";
-            case "inspection": return "ais.A_INSPECT_REPORT";
-            case "repair":     return "ais.A_REPAIR_REPORT";
-            case "photo":      return "ais.A_PHOTO_REPORT";
-            default:           return null;
+            case "survey":
+                return "ais.A_SURVEY_REPORT";
+            case "maintenance":
+                return "ais.A_MAINT_REPORT";
+            case "inspection":
+                return "ais.A_INSPECT_REPORT";
+            case "repair":
+                return "ais.A_REPAIR_REPORT";
+            case "photo":
+                return "ais.A_PHOTO_REPORT";
+            default:
+                return null;
         }
     }
 
-    private Map<String, Object> getReportData(String tableName, 
-                                               String locCd, String reportId) {
+    private Map<String, Object> getReportData(String tableName,
+            String locCd, String reportId) {
         Map<String, Object> data = new LinkedHashMap<String, Object>();
 
         String sql = "SELECT * FROM " + tableName + " WHERE LOC_CD = ?";
@@ -88,18 +94,36 @@ public class ReportServlet extends HttpServlet {
             log.error("Report query error: {}", e.getMessage());
             data.put("error", e.getMessage());
         } finally {
-            try { if (rs   != null) rs.close();   } catch (Exception ignored) {}
-            try { if (ps   != null) ps.close();   } catch (Exception ignored) {}
-            try { if (conn != null) conn.close(); } catch (Exception ignored) {}
+            try {
+                if (rs != null) {
+                    rs.close();
+
+                }
+            } catch (Exception ignored) {
+            }
+            try {
+                if (ps != null) {
+                    ps.close();
+
+                }
+            } catch (Exception ignored) {
+            }
+            try {
+                if (conn != null) {
+                    conn.close();
+
+                }
+            } catch (Exception ignored) {
+            }
         }
 
         return data;
     }
 
-    private String renderReportHtml(String type, String locCd, 
-                                     String reportId, Map<String, Object> data) {
+    private String renderReportHtml(String type, String locCd,
+            String reportId, Map<String, Object> data) {
         StringBuilder html = new StringBuilder();
-        
+
         html.append("<!DOCTYPE html><html><head>");
         html.append("<meta charset='UTF-8'>");
         html.append("<title>").append(type.toUpperCase()).append(" Report - ").append(locCd).append("</title>");
@@ -117,10 +141,10 @@ public class ReportServlet extends HttpServlet {
         html.append(".back-link:hover { text-decoration:underline; }");
         html.append("</style>");
         html.append("</head><body>");
-        
+
         html.append("<a href='javascript:window.close()' class='back-link'>← Close</a>");
-        html.append("<h1>📄 ").append(type.toUpperCase()).append(" Report</h1>");
-        
+        html.append("<h1> ").append(type.toUpperCase()).append(" Report</h1>");
+
         html.append("<div class='info-bar'>");
         html.append("<span><strong>Location:</strong> ").append(escapeHtml(locCd)).append("</span>");
         html.append("<span><strong>Report ID:</strong> ").append(escapeHtml(reportId)).append("</span>");
@@ -132,10 +156,14 @@ public class ReportServlet extends HttpServlet {
             html.append("<table>");
             for (Map.Entry<String, Object> entry : data.entrySet()) {
                 Object value = entry.getValue();
-                if (value == null) continue;
+                if (value == null) {
+                    continue;
+                }
                 String valStr = value.toString().trim();
-                if (valStr.isEmpty()) continue;
-                
+                if (valStr.isEmpty()) {
+                    continue;
+                }
+
                 html.append("<tr>");
                 html.append("<th>").append(escapeHtml(formatLabel(entry.getKey()))).append("</th>");
                 html.append("<td>").append(escapeHtml(valStr)).append("</td>");
@@ -152,18 +180,24 @@ public class ReportServlet extends HttpServlet {
         String[] parts = key.toLowerCase().split("_");
         StringBuilder sb = new StringBuilder();
         for (String part : parts) {
-            if (sb.length() > 0) sb.append(" ");
+            if (sb.length() > 0) {
+                sb.append(" ");
+            }
             if (part.length() > 0) {
                 sb.append(Character.toUpperCase(part.charAt(0)));
-                if (part.length() > 1) sb.append(part.substring(1));
+                if (part.length() > 1) {
+                    sb.append(part.substring(1));
+                }
             }
         }
         return sb.toString();
     }
 
     private String escapeHtml(String s) {
-        if (s == null) return "";
-        return s.replace("&","&amp;").replace("<","&lt;")
-                .replace(">","&gt;").replace("\"","&quot;");
+        if (s == null) {
+            return "";
+        }
+        return s.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace("\"", "&quot;");
     }
 }

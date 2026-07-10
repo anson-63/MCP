@@ -20,11 +20,11 @@ public class LocationServlet extends HttpServlet {
     private static final Logger log = LoggerFactory.getLogger(LocationServlet.class);
 
     private DatabaseManager db;
-    private ObjectMapper    mapper;
+    private ObjectMapper mapper;
 
     @Override
     public void init() {
-        db     = DatabaseManager.getInstance();
+        db = DatabaseManager.getInstance();
         mapper = new ObjectMapper();
     }
 
@@ -39,9 +39,9 @@ public class LocationServlet extends HttpServlet {
 
         if ("/general-info".equals(path)) {
             JsonNode body = mapper.readTree(req.getInputStream());
-            String locCd  = body.path("locCd").asText().trim();
+            String locCd = body.path("locCd").asText().trim();
 
-            log.info("locCd: {}", locCd);
+            log.info("[Manual Info]locCd: {}", locCd);
             Map<String, Object> result = db.getGeneralInfo(locCd);
             out.write(mapper.writeValueAsString(result));
 

@@ -7,58 +7,66 @@ import java.io.InputStream;
 import java.util.Properties;
 
 /**
- * Centralized configuration loader.
- * Reads application.properties from classpath (WEB-INF/classes/).
+ * Centralized configuration loader. Reads application.properties from classpath
+ * (WEB-INF/classes/).
  */
 public class AppConfig {
 
     private static final Logger log = LoggerFactory.getLogger(AppConfig.class);
-    
+
     private static final Properties props = new Properties();
     private static boolean loaded = false;
 
     // ── Load once on first access ──────────────────────────────
     private static synchronized void loadIfNeeded() {
-        if (loaded) return;
+        if (loaded) {
+            return;
+        }
 
         InputStream is = null;
         try {
             // 1️⃣ Try external file first (production override)
             String externalPath = System.getProperty(
-                "app.config", 
-                System.getenv("APP_CONFIG_PATH")
+                    "app.config",
+                    System.getenv("APP_CONFIG_PATH")
             );
-            
+
             if (externalPath != null) {
                 java.io.File f = new java.io.File(externalPath);
                 if (f.exists()) {
                     is = new java.io.FileInputStream(f);
-                    log.info("✅ Loading EXTERNAL config: {}", externalPath);
+                    log.info("[Manual Info]✅ Loading EXTERNAL config: {}", externalPath);
                 }
             }
 
             // 2️⃣ Fall back to classpath (dev / packaged)
             if (is == null) {
                 is = AppConfig.class.getClassLoader()
-                    .getResourceAsStream("application.properties");
-                log.info("✅ Loading classpath config");
+                        .getResourceAsStream("application.properties");
+                log.info("[Manual Info]✅ Loading classpath config");
             }
 
             if (is == null) {
-                log.error("❌ No config found!");
+                log.error("[Manual Error] No config found!");
                 loaded = true;
                 return;
             }
-            
+
             props.load(is);
             loaded = true;
-            log.info("Loaded {} properties", props.size());
+            log.info("[Manual Info]Loaded {} properties", props.size());
 
         } catch (Exception e) {
             log.error("Config load error: {}", e.getMessage());
             loaded = true;
         } finally {
-            try { if (is != null) is.close(); } catch (Exception ignored) {}
+            try {
+                if (is != null) {
+                    is.close();
+
+                }
+            } catch (Exception ignored) {
+            }
         }
     }
 
@@ -76,12 +84,14 @@ public class AppConfig {
     public static int getInt(String key, int defaultValue) {
         loadIfNeeded();
         String val = props.getProperty(key);
-        if (val == null) return defaultValue;
+        if (val == null) {
+            return defaultValue;
+        }
         try {
             return Integer.parseInt(val.trim());
         } catch (NumberFormatException e) {
-            log.warn("Invalid int for {}: {}, using default {}", 
-                     key, val, defaultValue);
+            log.warn("Invalid int for {}: {}, using default {}",
+                    key, val, defaultValue);
             return defaultValue;
         }
     }
@@ -89,7 +99,9 @@ public class AppConfig {
     public static double getDouble(String key, double defaultValue) {
         loadIfNeeded();
         String val = props.getProperty(key);
-        if (val == null) return defaultValue;
+        if (val == null) {
+            return defaultValue;
+        }
         try {
             return Double.parseDouble(val.trim());
         } catch (NumberFormatException e) {
@@ -100,27 +112,101 @@ public class AppConfig {
     public static boolean getBoolean(String key, boolean defaultValue) {
         loadIfNeeded();
         String val = props.getProperty(key);
-        if (val == null) return defaultValue;
+        if (val == null) {
+            return defaultValue;
+        }
         return Boolean.parseBoolean(val.trim());
     }
 
+    public static String getTencentApiKey() {
+        return get("tencent.api.key", "");
+    }
+
+    public static String getTencentBaseUrl() {
+        return get("tencent.api.base_url",
+                "https://domain");
+    }
+
+    public static String getTencentModel() {
+        return get("tencent.api.model", "deepseek-v3");
+    }
+
+    public static int getTenecentNumCtx() {
+        return getInt("tencent.api.num_ctx", 2048);
+    }
+
+    // Add a flag so you can switch at runtime
+    public static boolean useTencentCloud() {
+        return !getTencentApiKey().isEmpty();
+    }
+
     // ── Convenient typed accessors ─────────────────────────────
-    public static String dbUser()     { return get("db.user", ""); }
-    public static String dbPassword() { return get("db.password", ""); }
-    public static String dbServer()   { return get("db.server", ""); }
-    public static String dbName()     { return get("db.name", ""); }
-    public static String GISdbName()  { return get("gis_db.name", ""); }
-    
-    public static int    dbPoolMaxSize()        { return getInt("db.pool.max_size", 10); }
-    public static int    dbPoolMinIdle()        { return getInt("db.pool.min_idle", 2); }
-    public static int    dbConnectionTimeout()  { return getInt("db.connection_timeout", 30000); }
-    
-    public static String ollamaBaseUrl()        { return get("ollama.base_url", "http://<ollama-ip>:11434"); } //hardcode default
-    public static String ollamaModel()          { return get("ollama.model", "qwen3:4b-q4_K_M"); } //hardcode default
-    public static int    ollamaNumCtx()         { return getInt("ollama.num_ctx", 2048); } //hardcode default
-    public static double ollamaTemperature()    { return getDouble("ollama.temperature", 0.0); } //hardcode default
-    public static int    ollamaTimeoutSeconds() { return getInt("ollama.timeout_seconds", 120); } //hardcode default
-    
-    public static String reportAisBase()        { return get("report.url.ais_base", "https://domain/"); } //hardcode default
-    public static String reportDssrBase()       { return get("report.url.dssr_base", "http://domain/asdiis/sebiis/2k/application/dssr/reportmain.aspx"); } //hardcode default
+    public static String dbUser() {
+        return get("db.user", "");
+    }
+
+    public static String dbPassword() {
+        return get("db.password", "");
+    }
+
+    public static String dbServer() {
+        return get("db.server", "");
+    }
+
+    public static String dbName() {
+        return get("db.name", "");
+    }
+
+    public static String GISdbName() {
+        return get("gis_db.name", "");
+    }
+
+    public static int dbPoolMaxSize() {
+        return getInt("db.pool.max_size", 10);
+    }
+
+    public static int dbPoolMinIdle() {
+        return getInt("db.pool.min_idle", 2);
+    }
+
+    public static int dbConnectionTimeout() {
+        return getInt("db.connection_timeout", 30000);
+    }
+
+    public static String ollamaBaseUrl() {
+        return get("ollama.base_url", "http://localhost:11434");
+    } //hardcode default
+
+    public static String ollamaModel() {
+        return get("ollama.model", "qwen3:4b-q4_K_M");
+    } //hardcode default
+
+    public static String verifierModel() {
+        boolean tencent = useTencentCloud();
+        String defaultProviderModel = tencent ? getTencentModel() : ollamaModel();
+
+        return get("verifier.model", tencent
+                ? get("tencent.api.verifier.model", defaultProviderModel)
+                : get("ollama.verifier.model", defaultProviderModel));
+    }
+
+    public static int ollamaNumCtx() {
+        return getInt("ollama.num_ctx", 2048);
+    } //hardcode default
+
+    public static double ollamaTemperature() {
+        return getDouble("ollama.temperature", 0.0);
+    } //hardcode default
+
+    public static int ollamaTimeoutSeconds() {
+        return getInt("ollama.timeout_seconds", 120);
+    } //hardcode default
+
+    public static String reportAisBase() {
+        return get("report.url.ais_base", "https://domain/");
+    } //hardcode default
+
+    public static String reportDssrBase() {
+        return get("report.url.dssr_base", "http://domain/asdiis/sebiis/2k/application/dssr/reportmain.aspx");
+    } //hardcode default
 }

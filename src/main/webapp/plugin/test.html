@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>ArcGIS - AIS Location Map</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="initial-scale=1, maximum-scale=1, user-scalable=no">
+    <link rel="stylesheet" href="https://js.arcgis.com/4.14/esri/css/main.css">
+    <script src="https://js.arcgis.com/5.1/"></script>
+    <style>
+        html,
+        body,
+        #viewDiv {
+            padding: 0;
+            margin: 0;
+            height: 100%;
+            width: 100%;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="viewDiv"></div>
+    <arcgis-assistant log-enabled copy-enabled reference-element="#base-map-view" heading="AIS"
+        description="Explore AIS."
+        entry-message="Hello! I'm here to help you explore changes in wheat production over the years.">
+        <arcgis-assistant-navigation-agent></arcgis-assistant-navigation-agent>
+        <arcgis-assistant-data-exploration-agent></arcgis-assistant-data-exploration-agent>
+        <arcgis-assistant-help-agent></arcgis-assistant-help-agent>
+    </arcgis-assistant>
+    <script type="module">
+        const [Map, MapView, Home, TileLayer, FeatureLayer, GraphicsLayer, Graphic, Polygon] =
+            await import([
+                "@arcgis/core/Map.js",
+                "@arcgis/core/views/MapView.js",
+                "@arcgis/core/widgets/Home.js",
+                "@arcgis/core/layers/TileLayer.js",
+                "@arcgis/core/layers/FeatureLayer.js",
+                "@arcgis/core/layers/GraphicsLayer.js",
+                "@arcgis/core/Graphic.js",
+                "@arcgis/core/geometry/Polygon.js",
+                "dojo/domReady!"
+            ]);
+        const urlParams = new URLSearchParams(window.location.search);
+        const locCd = urlParams.get('locCd');
+
+        const map = new Map();
+        const view = new MapView({
+            id: "base-map-view",
+            container: "viewDiv",
+            map: map
+        });
+
+        const homeBtn = new Home({ view: view });
+        view.ui.add(homeBtn, "top-left");
+
+        // Basemap layer
+        const basemapLayer = new TileLayer({
+            url: "https://domain/arcgis_server/rest/services/AIS_Basemap/MapServer"
+        });
+        map.add(basemapLayer);
+
+        // Asset layer
+        const assetLayer = new FeatureLayer({
+            url: "https://domain/arcgis_server/rest/services/ASSETMap/MapServer/2"
+        });
+        map.add(assetLayer);
+
+        const graphicsLayer = new GraphicsLayer();
+        map.add(graphicsLayer);
+
+        function drawPolygon(rings, extent) {
+            const polygon = new Polygon({
+                rings: rings,
+                spatialReference: { wkid: 102140 }
+            });
+
+            const graphic = new Graphic({
+                geometry: polygon,
+                symbol: {
+                    type: "simple-fill",
+                    color: [0, 0, 255, 0.5],
+                    outline: {
+                        color: [0, 0, 255, 1],
+                        width: 2
+                    }
+                }
+            });
+
+            graphicsLayer.add(graphic);
+            view.goTo(polygon);
+        }
+
+        function queryLayer(locCd) {
+            if (!locCd) return;
+
+            const whereClause = `LOC_CD = '${locCd}'`;
+            const query = {
+                where: whereClause,
+                spatialRelationship: "intersects",
+                returnGeometry: true,
+                outFields: ["*"],
+                outSpatialReference: { wkid: 102140 }
+            };
+
+            assetLayer.queryFeatures(query)
+                .then(function (results) {
+                    if (results.features.length > 0) {
+                        const feature = results.features[0];
+                        drawPolygon(feature.geometry.rings, feature.geometry.extent);
+                    } else {
+                        console.warn("No feature found for LOC_CD:", locCd);
+                    }
+                })
+                .catch(function (error) {
+                    console.error("Error querying layer:", error);
+                });
+        }
+
+        // Auto-query if locCd is passed in URL
+        if (locCd) {
+            // Wait for layers to load before querying
+            view.whenLayerView(assetLayer).then(() => {
+                queryLayer(locCd);
+            });
+        }
+        const assistantElement = document.querySelector("arcgis-assistant");
+        const mapElement = document.querySelector("arcgis-map");
+        assistantElement.suggestedPrompts = [
+            "Go to the county that produced the most wheat in 2022.",
+            "How does that compare to the average county that produced wheat?",
+            "How many counties produced less wheat in 2022 than in 2017?",
+        ];
+    </script>
+</body>
+
+</html>

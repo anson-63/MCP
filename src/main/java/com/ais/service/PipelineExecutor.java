@@ -26,14 +26,14 @@ public class PipelineExecutor {
 
     public ExecutionResult execute(Plan plan) {
 
-        List<LocationResult> resultSet    = new ArrayList<LocationResult>();
-        String               detailOutput = null;
+        List<LocationResult> resultSet = new ArrayList<LocationResult>();
+        String detailOutput = null;
 
         for (Intent intent : plan.getSteps()) {
-            log.info("▶ Executing intent: {} role={}", intent.type, intent.role);
+            log.info("[Manual Info]▶ Executing intent: {} role={}", intent.type, intent.role);
 
-            IntentRole role     = intent.role;
-            String     toolName = intent.toolName;
+            IntentRole role = intent.role;
+            String toolName = intent.toolName;
 
             // Build args from intent params
             Map<String, Object> args = new LinkedHashMap<String, Object>();
@@ -47,11 +47,11 @@ public class PipelineExecutor {
                     continue;
                 }
                 resultSet = toolRunner.runList(toolName, args);
-                log.info("  → {} results", resultSet.size());
+                log.info("[Manual Info]  → {} results", resultSet.size());
 
             } else if (role == IntentRole.SECONDARY) {
                 if (resultSet.isEmpty()) {
-                    log.info("  → Skipped SECONDARY (empty result set)");
+                    log.info("[Manual Info]  → Skipped SECONDARY (empty result set)");
                     continue;
                 }
                 Set<String> codes = new LinkedHashSet<String>();
@@ -63,17 +63,17 @@ public class PipelineExecutor {
                 args.put("codes", codes);
                 List<LocationResult> enriched = toolRunner.runList(toolName, args);
                 resultSet = mergeEnrichment(resultSet, enriched);
-                log.info("  → Merged enrichment, {} results", resultSet.size());
+                log.info("[Manual Info]  → Merged enrichment, {} results", resultSet.size());
 
             } else if (role == IntentRole.ACTION) {
                 detailOutput = toolRunner.runDetail(toolName, args);
-                log.info("  → Detail fetched");
+                log.info("[Manual Info]  → Detail fetched");
 
             } else if (role == IntentRole.ACTION_ON_RESULT) {
                 List<LocationResult> targets = applyModifier(resultSet, plan.getModifier());
                 if (!targets.isEmpty()) {
                     String code = targets.get(0).getLocationCode();
-                    log.info("  → ACTION_ON_RESULT using code: {}", code);
+                    log.info("[Manual Info]  → ACTION_ON_RESULT using code: {}", code);
                     args.put("code", code);
                     detailOutput = toolRunner.runDetail(toolName, args);
                 } else {
@@ -81,7 +81,7 @@ public class PipelineExecutor {
                 }
 
             } else {
-                log.warn("  ⚠️ MODIFIER/UNKNOWN role — skipping tool call: {}", intent.type);
+                log.warn("   MODIFIER/UNKNOWN role — skipping tool call: {}", intent.type);
             }
         }
 
@@ -94,11 +94,12 @@ public class PipelineExecutor {
     }
 
     // ── Modifier ──────────────────────────────────────────────────────
-
     private List<LocationResult> applyModifier(
             List<LocationResult> results, String modifier) {
 
-        if (modifier == null || results.isEmpty()) return results;
+        if (modifier == null || results.isEmpty()) {
+            return results;
+        }
 
         String mod = modifier.toUpperCase();
 
@@ -137,7 +138,6 @@ public class PipelineExecutor {
     }
 
     // ── Enrichment merge ──────────────────────────────────────────────
-
     private List<LocationResult> mergeEnrichment(
             List<LocationResult> base,
             List<LocationResult> enriched) {
@@ -150,15 +150,20 @@ public class PipelineExecutor {
             }
         }
 
-        Set<String>          seen   = new LinkedHashSet<String>();
+        Set<String> seen = new LinkedHashSet<String>();
         List<LocationResult> merged = new ArrayList<LocationResult>();
 
         for (LocationResult r : base) {
-            if (r.getLocationCode() == null) continue;
-            if (!seen.add(r.getLocationCode())) continue; // deduplicate
-
+            if (r.getLocationCode() == null) {
+                continue;
+            }
+            if (!seen.add(r.getLocationCode())) {
+                continue; // deduplicate
+            }
             LocationResult e = enrichMap.get(r.getLocationCode());
-            if (e != null) r.mergeFrom(e);
+            if (e != null) {
+                r.mergeFrom(e);
+            }
             merged.add(r);
         }
 

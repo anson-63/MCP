@@ -7,10 +7,14 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 public class PrimaryLlmNode implements GraphNode {
 
     private static final Logger log = LoggerFactory.getLogger(PrimaryLlmNode.class);
+
     private final OllamaService ollamaService;
 
     public PrimaryLlmNode(OllamaService ollamaService) {
@@ -20,39 +24,56 @@ public class PrimaryLlmNode implements GraphNode {
     @Override
     public GraphState process(GraphState state) {
         int attempt = state.getRetryCount() + 1;
-        log.info("[PrimaryLlmNode] Generating response (attempt {})", attempt);
+        log.info("[Manual Info][PrimaryLlmNode] Generating response (attempt {})", attempt);
 
         try {
             String prompt = buildPrompt(state);
 
-            // ── Use invoke() which is the real method ──────────
-            OllamaService.AgentResult result =
-                ollamaService.invoke(prompt, state.getSessionId());
+            // Use invoke() which is the real method
+            OllamaService.AgentResult result
+                    = ollamaService.invoke(prompt, state.getSessionId());
 
-            // ── Extract answer ─────────────────────────────────
+            // Extract answer
             String responseText = result.getAnswer();
             if (responseText == null || responseText.isEmpty()) {
                 responseText = "No response generated.";
             }
             state.setPrimaryResponse(responseText);
 
-            // ── Extract tool metadata ──────────────────────────
+            // Extract tool metadata
             try {
                 state.setToolCallsMade(result.getToolNames());
             } catch (Exception e) {
                 log.warn("[PrimaryLlmNode] Could not get tool names: {}", e.getMessage());
                 state.setToolCallsMade(new ArrayList<>());
             }
-
             try {
                 state.setRawToolOutput(result.getToolSummary());
             } catch (Exception e) {
                 log.warn("[PrimaryLlmNode] Could not get tool summary: {}", e.getMessage());
                 state.setRawToolOutput("");
             }
-
-            log.info("[PrimaryLlmNode] Got response ({} chars)", responseText.length());
-
+            
+            try {
+                List<Map<String, Object>> details = new ArrayList<>();
+                for (OllamaService.AgentResult.ToolCallRecord record : result.getToolCalls()) {
+                    Map<String, Object> entry = new LinkedHashMap<>();
+                    entry.put("name", record.getToolName());
+                    entry.put("args", record.getArgs() != null
+                            ? record.getArgs() : new LinkedHashMap<String, Object>());
+                    entry.put("result", record.getOutput() != null
+                            ? record.getOutput() : "");
+                    details.add(entry);
+                }
+                state.setToolCallDetails(details);
+                log.info("[Manual Info][PrimaryLlmNode] Captured {} individual tool-call record(s)",
+                        details.size());
+            } catch (Exception e) {
+                log.warn("[PrimaryLlmNode] Could not build tool call details: {}", e.getMessage());
+                state.setToolCallDetails(new ArrayList<>());
+            }
+            
+            log.info("[Manual Info][PrimaryLlmNode] Got response ({} chars)", responseText.length());
         } catch (Exception e) {
             log.error("[PrimaryLlmNode] LLM call failed: {}", e.getMessage(), e);
             state.setPrimaryResponse("I encountered an error processing your request.");
@@ -68,8 +89,8 @@ public class PrimaryLlmNode implements GraphNode {
         }
         // On retry, tell the LLM what was wrong
         return state.getUserQuery()
-            + "\n\n[Previous answer was flagged: "
-            + state.getVerificationReason()
-            + ". Please provide a more accurate response.]";
+                + "\n\n[Previous answer was flagged: "
+                + state.getVerificationReason()
+                + ". Please provide a more accurate response.]";
     }
 }

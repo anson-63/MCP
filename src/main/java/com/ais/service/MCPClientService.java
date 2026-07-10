@@ -41,7 +41,7 @@ public class MCPClientService {
 
             // Auto-fallback: if value doesn't look like a code → name search
             if (locCd != null && !locCd.matches("(?i)^[A-Z]{2}\\d{11}$")) {
-                log.info("'{}' is not a code — falling back to name search", locCd);
+                log.info("[Manual Info]'{}' is not a code — falling back to name search", locCd);
                 List<Map<String, Object>> results = db.searchByName(locCd, null);
                 return responseOf("count", results.size(), "results", results);
             }
@@ -51,19 +51,21 @@ public class MCPClientService {
 
         // ── search_by_name ────────────────────────────────────────
         handlers.put("search_by_name", args -> {
-            String locName  = getArg(args, "locName",  null);
+            String locName = getArg(args, "locName", null);
             String location = getArg(args, "location", null);
-
-            List<Map<String, Object>> results = db.searchByName(locName, location);
+            Integer limit = getIntArg(args, "limit");
+            String excludeUndefinedField = getArg(args, "excludeUndefinedField", null);
+            
+            List<Map<String, Object>> results = db.searchByName(locName, location, limit, excludeUndefinedField);
             return responseOf(
-                "count",    results.size(),
-                "results",  results,
-                "location", location   // echo back for formatAsHtml
+                    "count", results.size(),
+                    "results", results,
+                    "location", location
             );
         });
 
         // ── show_schema / refresh_schema ──────────────────────────
-        handlers.put("show_schema",    args -> db.introspectSchema());
+        handlers.put("show_schema", args -> db.introspectSchema());
         handlers.put("refresh_schema", args -> db.introspectSchema());
 
         // ── check_reports ─────────────────────────────────────────
@@ -74,11 +76,13 @@ public class MCPClientService {
             Object cdsObj = args.get("locCds");
             if (cdsObj instanceof List) {
                 for (Object o : (List<?>) cdsObj) {
-                    if (o != null) locCds.add(o.toString().trim().toUpperCase());
+                    if (o != null) {
+                        locCds.add(o.toString().trim().toUpperCase());
+                    }
                 }
             }
 
-            log.info("check_reports: type={} count={}", reportType, locCds.size());
+            log.info("[Manual Info]check_reports: type={} count={}", reportType, locCds.size());
             return db.checkReportsForLocations(reportType, locCds);
         });
 
@@ -88,80 +92,92 @@ public class MCPClientService {
             int totalLocations = psms.stream()
                     .mapToInt(p -> (Integer) p.get("count")).sum();
             return responseOf(
-                "totalPsms",       psms.size(),
-                "totalLocations",  totalLocations,
-                "psms",            psms
+                    "totalPsms", psms.size(),
+                    "totalLocations", totalLocations,
+                    "psms", psms
             );
         });
 
         // ── locations_by_psm ──────────────────────────────────────
         handlers.put("locations_by_psm", args -> {
-            String psm      = getArg(args, "psm",      "");
+            String psm = getArg(args, "psm", "");
             String location = getArg(args, "location", null);
+            Integer limit = getIntArg(args, "limit");
+            String excludeUndefinedField = getArg(args, "excludeUndefinedField", null);
 
-            List<Map<String, Object>> results = db.getLocationsByPsm(psm, location);
+            List<Map<String, Object>> results = db.getLocationsByPsm(psm, location, limit, excludeUndefinedField);
             return responseOf(
-                "psm",      psm,
-                "count",    results.size(),
-                "results",  results,
-                "location", location
+                    "psm", psm,
+                    "count", results.size(),
+                    "results", results,
+                    "location", location
             );
         });
 
         // ── locations_by_dept ─────────────────────────────────────
         handlers.put("locations_by_dept", args -> {
-            String deptCd   = getArg(args, "deptCd",   "").toUpperCase().trim();
+            String deptCd = getArg(args, "deptCd", "").toUpperCase().trim();
             String location = getArg(args, "location", null);
+            Integer limit = getIntArg(args, "limit");
+            String excludeUndefinedField = getArg(args, "excludeUndefinedField", null);
 
-            List<Map<String, Object>> results = db.getLocationsByDept(deptCd, location);
+            List<Map<String, Object>> results = db.getLocationsByDept(deptCd, location, limit, excludeUndefinedField);
             return responseOf(
-                "deptCd",   deptCd,
-                "count",    results.size(),
-                "results",  results,
-                "location", location
+                    "deptCd", deptCd,
+                    "count", results.size(),
+                    "results", results,
+                    "location", location
             );
         });
 
         // ── search_declared_monument ──────────────────────────────
         handlers.put("search_declared_monument", args -> {
-            String filter   = getArg(args, "filter",   "T").toUpperCase().trim();
+            String filter = getArg(args, "filter", "T").toUpperCase().trim();
             String location = getArg(args, "location", null);
-
-            List<Map<String, Object>> results = db.getDeclaredMonuments(filter, location);
+            Integer limit = getIntArg(args, "limit");
+            String excludeUndefinedField = getArg(args, "excludeUndefinedField", null);
+            
+            List<Map<String, Object>> results = db.getDeclaredMonuments(filter, location, limit, excludeUndefinedField);
             return responseOf(
-                "filter",   filter,
-                "count",    results.size(),
-                "results",  results,
-                "location", location
+                    "filter", filter,
+                    "count", results.size(),
+                    "results", results,
+                    "location", location
             );
         });
 
         // ── search_historic_building ──────────────────────────────
         handlers.put("search_historic_building", args -> {
-            String grade    = getArg(args, "grade",    "ALL").toUpperCase().trim();
+            String grade = getArg(args, "grade", "ALL").toUpperCase().trim();
             String location = getArg(args, "location", null);
+            Integer limit = getIntArg(args, "limit");
+            String excludeUndefinedField = getArg(args, "excludeUndefinedField", null);
 
-            List<Map<String, Object>> results = db.getHistoricBuildings(grade, location);
+            List<Map<String, Object>> results = db.getHistoricBuildings(grade, location, limit, excludeUndefinedField);
             return responseOf(
-                "grade",    grade,
-                "count",    results.size(),
-                "results",  results,
-                "location", location
+                    "grade", grade,
+                    "count", results.size(),
+                    "results", results,
+                    "location", location
             );
         });
 
         // ── search_loc_cd_history ─────────────────────────────────
         handlers.put("search_loc_cd_history", args -> {
-            String formerCd  = getArg(args, "formerLocCd",  "").toUpperCase().trim();
+            String formerCd = getArg(args, "formerLocCd", "").toUpperCase().trim();
             String currentCd = getArg(args, "currentLocCd", "").toUpperCase().trim();
 
-            List<Map<String, Object>> results =
-                    db.getLocCdChangeHistory(formerCd, currentCd);
+            List<Map<String, Object>> results
+                    = db.getLocCdChangeHistory(formerCd, currentCd);
 
             Map<String, Object> response = new LinkedHashMap<String, Object>();
-            if (!formerCd.isEmpty())  response.put("formerLocCd",  formerCd);
-            if (!currentCd.isEmpty()) response.put("currentLocCd", currentCd);
-            response.put("count",   results.size());
+            if (!formerCd.isEmpty()) {
+                response.put("formerLocCd", formerCd);
+            }
+            if (!currentCd.isEmpty()) {
+                response.put("currentLocCd", currentCd);
+            }
+            response.put("count", results.size());
             response.put("results", results);
             return response;
         });
@@ -171,7 +187,7 @@ public class MCPClientService {
     // MAIN DISPATCH — single entry point for all tool calls
     // ══════════════════════════════════════════════════════════════
     public String callTool(String toolName, Map<String, Object> args) {
-        log.info("Calling tool: {} with args: {}", toolName, args);
+        log.info("[Manual Info]Calling tool: {} with args: {}", toolName, args);
 
         try {
             Function<Map<String, Object>, Object> handler = handlers.get(toolName);
@@ -197,6 +213,7 @@ public class MCPClientService {
     // Adding a new tool = one new ToolDef + one handler entry.
     // ══════════════════════════════════════════════════════════════
     private static class ToolDef {
+
         final String name;
         final String description;
         final Map<String, Object> properties;
@@ -212,15 +229,15 @@ public class MCPClientService {
                 Map<String, Object> properties, List<String> required,
                 String icon, String samplePrompt, boolean needsInput,
                 String inputHint, String placeholder) {
-            this.name         = name;
-            this.description  = description;
-            this.properties   = properties;
-            this.required     = required;
-            this.icon         = icon;
+            this.name = name;
+            this.description = description;
+            this.properties = properties;
+            this.required = required;
+            this.icon = icon;
             this.samplePrompt = samplePrompt;
-            this.needsInput   = needsInput;
-            this.inputHint    = inputHint;
-            this.placeholder  = placeholder;
+            this.needsInput = needsInput;
+            this.inputHint = inputHint;
+            this.placeholder = placeholder;
         }
     }
 
@@ -230,36 +247,38 @@ public class MCPClientService {
 
         // ── hardcode_query ────────────────────────────────────────
         defs.add(new ToolDef(
-            "hardcode_query",
-            "Get full location details AND list of available reports "
-            + "(survey, maintenance, inspection, repair, photo) for a specific "
-            + "location code (e.g., 'SB04400361000').",
-            props("locCd", prop("string",
-                "Location Code (format: SB followed by digits, e.g., SB04400361000)")),
-            list("locCd"),
-            "📋", "Get info for ", true, "location code", "e.g., SB04400361000"
+                "hardcode_query",
+                "Get full location details AND list of available reports "
+                + "(survey, maintenance, inspection, repair, photo) for a specific "
+                + "location code (e.g., 'SB04400361000').",
+                props("locCd", prop("string",
+                        "Location Code (format: SB followed by digits, e.g., SB04400361000)")),
+                list("locCd"),
+                "", "Get info for ", true, "location code", "e.g., SB04400361000"
         ));
 
         // ── search_by_name ────────────────────────────────────────
         defs.add(new ToolDef(
-            "search_by_name",
-            "Search for locations by name when user provides a name instead of "
-            + "a code (e.g., 'Sha Tin Park', 'hospital', 'school'). Returns matching "
-            + "locations with their codes. Use this when input is human-readable text.",
-            props("locName", prop("string",
-                    "Location name or partial name (e.g., 'Sha Tin Park', 'park')"),
-                  "location", prop("string",
-                    "Optional district/area filter (e.g., 'Sha Tin', 'Lo Wu')")),
-            list("locName"),
-            "🔍", "Search location named ", true, "location name", "e.g., Sha Tin Park"
+                "search_by_name",
+                "Search for locations by name when user provides a name instead of "
+                + "a code (e.g., 'Sha Tin Park', 'hospital', 'school'). Returns matching "
+                + "locations with their codes. Use this when input is human-readable text.",
+                props("locName", prop("string",
+                        "Location name or partial name (e.g., 'Sha Tin Park', 'park')"),
+                        "location", prop("string",
+                                "Optional district/area filter (e.g., 'Sha Tin', 'Lo Wu')"),
+                        "limit", limitProp(),
+                        "excludeUndefinedField", excludeUndefinedProp()),
+                list("locName"),
+                "", "Search location named ", true, "location name", "e.g., Sha Tin Park"
         ));
 
         // ── show_schema ───────────────────────────────────────────
         defs.add(new ToolDef(
-            "show_schema",
-            "Show what tables and columns exist in the database",
-            props(), list(),
-            "🗄️", "Show database schema", false, null, null
+                "show_schema",
+                "Show what tables and columns exist in the database",
+                props(), list(),
+                "", "Show database schema", false, null, null
         ));
 
         // ── check_reports ─────────────────────────────────────────
@@ -276,49 +295,53 @@ public class MCPClientService {
                 "List of location codes to check (e.g., ['SB04400361000'])");
 
         defs.add(new ToolDef(
-            "check_reports",
-            "Check which locations from a list have a specific report available. "
-            + "Returns clickable report links for locations that have them.",
-            props("reportType", reportTypeProp, "locCds", locCdsProp),
-            list("reportType", "locCds"),
-            "📄", "Check BSI reports for ", true, "location codes",
-            "e.g., SB04400361000, SC04400206005"
+                "check_reports",
+                "Check which locations from a list have a specific report available. "
+                + "Returns clickable report links for locations that have them.",
+                props("reportType", reportTypeProp, "locCds", locCdsProp),
+                list("reportType", "locCds"),
+                "", "Check BSI reports for ", true, "location codes",
+                "e.g., SB04400361000, SC04400206005"
         ));
 
         // ── list_psms ─────────────────────────────────────────────
         defs.add(new ToolDef(
-            "list_psms",
-            "List all distinct PSM (Property Service Manager) values with the count "
-            + "of locations under each.",
-            props(), list(),
-            "👥", "List all PSMs", false, null, null
+                "list_psms",
+                "List all distinct PSM (Property Service Manager) values with the count "
+                + "of locations under each.",
+                props(), list(),
+                "", "List all PSMs", false, null, null
         ));
 
         // ── locations_by_psm ──────────────────────────────────────
         defs.add(new ToolDef(
-            "locations_by_psm",
-            "Get list of locations managed by a specific PSM. "
-            + "Use after list_psms when user wants to see which locations a PSM manages.",
-            props("psm", prop("string", "PSM name (e.g., 'SHA TIN EAST')"),
-                  "location", prop("string",
-                    "Optional district filter (e.g., 'Sha Tin')")),
-            list("psm"),
-            "📌", "Show locations under PSM ", true, "PSM name", "e.g., SHA TIN EAST"
+                "locations_by_psm",
+                "Get list of locations managed by a specific PSM. "
+                + "Use after list_psms when user wants to see which locations a PSM manages.",
+                props("psm", prop("string", "PSM name (e.g., 'SHA TIN EAST')"),
+                        "location", prop("string",
+                                "Optional district filter (e.g., 'Sha Tin')"),
+                        "limit", limitProp(),
+                        "excludeUndefinedField", excludeUndefinedProp()),
+                list("psm"),
+                "", "Show locations under PSM ", true, "PSM name", "e.g., SHA TIN EAST"
         ));
 
         // ── locations_by_dept ─────────────────────────────────────
         defs.add(new ToolDef(
-            "locations_by_dept",
-            "Get locations owned/used by a specific department. "
-            + "Use when user asks 'which locations belong to AFCD', "
-            + "'show LCSD buildings', 'list HD properties', etc.",
-            props("deptCd", prop("string",
-                    "Department code (e.g., 'AFCD', 'LCSD', 'HD', 'DSD')"),
-                  "location", prop("string",
-                    "Optional district filter (e.g., 'Sha Tin')")),
-            list("deptCd"),
-            "🏢", "Show locations for department ", true, "department code",
-            "e.g., AFCD, LCSD, HD"
+                "locations_by_dept",
+                "Get locations owned/used by a specific department. "
+                + "Use when user asks 'which locations belong to AFCD', "
+                + "'show LCSD buildings', 'list HD properties', etc.",
+                props("deptCd", prop("string",
+                        "Department code (e.g., 'AFCD', 'LCSD', 'HD', 'DSD')"),
+                        "location", prop("string",
+                                "Optional district filter (e.g., 'Sha Tin')"),
+                        "limit", limitProp(),
+                        "excludeUndefinedField", excludeUndefinedProp()),
+                list("deptCd"),
+                "", "Show locations for department ", true, "department code",
+                "e.g., AFCD, LCSD, HD"
         ));
 
         // ── search_declared_monument ──────────────────────────────
@@ -328,51 +351,55 @@ public class MCPClientService {
         filterProp.put("enum", Arrays.asList("T", "F", "ALL"));
 
         defs.add(new ToolDef(
-            "search_declared_monument",
-            "Search locations that are declared monuments. "
-            + "Filter can be T (monuments), F (non-monuments), ALL (both). "
-            + "Optionally filter by location name.",
-            props("filter",   filterProp,
-                  "location", prop("string",
-                    "Optional district filter (e.g., 'Sha Tin', 'Lo Wu')")),
-            list(),
-            "🏛️", "Show declared monuments ", true, "T / F / ALL",
-            "e.g., T for monuments"
+                "search_declared_monument",
+                "Search locations that are declared monuments. "
+                + "Filter can be T (monuments), F (non-monuments), ALL (both). "
+                + "Optionally filter by location name.",
+                props("filter", filterProp,
+                        "location", prop("string",
+                                "Optional district filter (e.g., 'Sha Tin', 'Lo Wu')"),
+                        "limit", limitProp(),
+                        "excludeUndefinedField", excludeUndefinedProp()),
+                list(),
+                "", "Show declared monuments ", true, "T / F / ALL",
+                "e.g., T for monuments"
         ));
 
         // ── search_historic_building ──────────────────────────────
         defs.add(new ToolDef(
-            "search_historic_building",
-            "Search locations that are graded historic buildings. "
-            + "Grade can be 1, 2, 3, ALL, or NONE. "
-            + "Optionally filter by location name.",
-            props("grade",    prop("string",
-                    "Grade of historic building: '1', '2', '3', or 'ALL'. "
-                    + "Use '0' or 'NONE' for non-graded buildings."),
-                  "location", prop("string",
-                    "Optional district filter (e.g., 'Sha Tin')")),
-            list(),
-            "🏰", "Show historic buildings grade ", true, "grade (1/2/3/ALL)",
-            "e.g., 1, 2, 3, ALL"
+                "search_historic_building",
+                "Search locations that are graded historic buildings. "
+                + "Grade can be 1, 2, 3, ALL, or NONE. "
+                + "Optionally filter by location name.",
+                props("grade", prop("string",
+                        "Grade of historic building: '1', '2', '3', or 'ALL'. "
+                        + "Use '0' or 'NONE' for non-graded buildings."),
+                        "location", prop("string",
+                                "Optional district filter (e.g., 'Sha Tin')"),
+                        "limit", limitProp(),
+                        "excludeUndefinedField", excludeUndefinedProp()),
+                list(),
+                "", "Show historic buildings grade ", true, "grade (1/2/3/ALL)",
+                "e.g., 1, 2, 3, ALL"
         ));
 
         // ── search_loc_cd_history ─────────────────────────────────
         defs.add(new ToolDef(
-            "search_loc_cd_history",
-            "Look up location code change history. Use when user asks "
-            + "'what is the new code for UD04400253000', "
-            + "'what was the old code for UC04400251000', "
-            + "'location code change history', 'former code', 'previous code', etc. "
-            + "Provide either formerLocCd or currentLocCd (or both).",
-            props("formerLocCd",  prop("string",
-                    "Former location code to look up (e.g., 'UD04400253000'). "
-                    + "Returns the current location code(s)."),
-                  "currentLocCd", prop("string",
-                    "Current location code to look up (e.g., 'UC04400251000'). "
-                    + "Returns former location code(s).")),
-            list(),
-            "📜", "Search location code history for ", true, "location code",
-            "e.g., UD04400253000"
+                "search_loc_cd_history",
+                "Look up location code change history. Use when user asks "
+                + "'what is the new code for UD04400253000', "
+                + "'what was the old code for UC04400251000', "
+                + "'location code change history', 'former code', 'previous code', etc. "
+                + "Provide either formerLocCd or currentLocCd (or both).",
+                props("formerLocCd", prop("string",
+                        "Former location code to look up (e.g., 'UD04400253000'). "
+                        + "Returns the current location code(s)."),
+                        "currentLocCd", prop("string",
+                                "Current location code to look up (e.g., 'UC04400251000'). "
+                                + "Returns former location code(s).")),
+                list(),
+                "", "Search location code history for ", true, "location code",
+                "e.g., UD04400253000"
         ));
 
         return defs;
@@ -386,26 +413,26 @@ public class MCPClientService {
 
         for (ToolDef def : getToolDefs()) {
             Map<String, Object> schema = new LinkedHashMap<String, Object>();
-            schema.put("type",       "object");
+            schema.put("type", "object");
             schema.put("properties", def.properties);
-            schema.put("required",   def.required);
+            schema.put("required", def.required);
 
             Map<String, Object> function = new LinkedHashMap<String, Object>();
-            function.put("name",        def.name);
+            function.put("name", def.name);
             function.put("description", def.description);
-            function.put("parameters",  schema);
+            function.put("parameters", schema);
 
             Map<String, Object> ui = new LinkedHashMap<String, Object>();
-            ui.put("icon",         def.icon);
+            ui.put("icon", def.icon);
             ui.put("samplePrompt", def.samplePrompt);
-            ui.put("needsInput",   def.needsInput);
-            ui.put("inputHint",    def.inputHint);
-            ui.put("placeholder",  def.placeholder);
+            ui.put("needsInput", def.needsInput);
+            ui.put("inputHint", def.inputHint);
+            ui.put("placeholder", def.placeholder);
 
             Map<String, Object> tool = new LinkedHashMap<String, Object>();
-            tool.put("type",     "function");
+            tool.put("type", "function");
             tool.put("function", function);
-            tool.put("ui",       ui);
+            tool.put("ui", ui);
 
             tools.add(tool);
         }
@@ -419,13 +446,13 @@ public class MCPClientService {
 
         for (ToolDef def : getToolDefs()) {
             Map<String, Object> uiTool = new LinkedHashMap<String, Object>();
-            uiTool.put("name",         def.name);
-            uiTool.put("description",  def.description);
-            uiTool.put("icon",         def.icon);
+            uiTool.put("name", def.name);
+            uiTool.put("description", def.description);
+            uiTool.put("icon", def.icon);
             uiTool.put("samplePrompt", def.samplePrompt);
-            uiTool.put("needsInput",   def.needsInput);
-            uiTool.put("inputHint",    def.inputHint);
-            uiTool.put("placeholder",  def.placeholder);
+            uiTool.put("needsInput", def.needsInput);
+            uiTool.put("inputHint", def.inputHint);
+            uiTool.put("placeholder", def.placeholder);
             uiTools.add(uiTool);
         }
 
@@ -435,11 +462,22 @@ public class MCPClientService {
     // ══════════════════════════════════════════════════════════════
     // BUILDER HELPERS
     // ══════════════════════════════════════════════════════════════
-
+    private Map<String, Object> limitProp() {
+        return prop("integer",
+                "Optional maximum number of results to return, if the user asked for "
+                + "a specific count (e.g. 'top 50', 'first 20'). Omit to use the "
+                + "default page size.");
+    }
+    private Map<String, Object> excludeUndefinedProp() {
+        Map<String, Object> p = prop("string",
+                "Optional filter. Excludes decommissioned or placeholder records where the specified field is NULL, blank, '-', or literally 'UNDEFINED'. Use 'address' when the user asks for valid/real addresses or 'not null' addresses.");
+        p.put("enum", Arrays.asList("address", "name", "department"));
+        return p;
+    }
     // ── Build a single property ───────────────────────────────────
     private Map<String, Object> prop(String type, String description) {
         Map<String, Object> p = new LinkedHashMap<String, Object>();
-        p.put("type",        type);
+        p.put("type", type);
         p.put("description", description);
         return p;
     }
@@ -478,12 +516,29 @@ public class MCPClientService {
         return (val != null && !val.toString().trim().isEmpty())
                 ? val.toString().trim() : defaultVal;
     }
+    
+    // ──Add a shared arg-reading helper ────────────────
+    private Integer getIntArg(Map<String, Object> args, String key) {
+        Object val = args.get(key);
+        if (val == null) {
+            return null;
+        }
+        if (val instanceof Number) {
+            return ((Number) val).intValue();
+        }
+        try {
+            return Integer.parseInt(val.toString().trim());
+        } catch (NumberFormatException e) {
+            log.warn("[Manual Info] Could not parse '{}' as integer for arg '{}' — ignoring", val, key);
+            return null;
+        }
+    }
 
     // ── Serialize to JSON ─────────────────────────────────────────
     private String toJson(Object obj) {
         try {
             return mapper.writerWithDefaultPrettyPrinter()
-                         .writeValueAsString(obj);
+                    .writeValueAsString(obj);
         } catch (Exception e) {
             log.error("JSON serialization failed: {}", e.getMessage());
             return errorJson("JSON serialization failed: " + e.getMessage());
@@ -494,13 +549,13 @@ public class MCPClientService {
     private String errorJson(String message) {
         return "{\"error\": \"" + message.replace("\"", "'") + "\"}";
     }
-    
+
     /**
-     * Run a tool and return a list of LocationResult objects.
-     * Used by PipelineExecutor for PRIMARY and SECONDARY steps.
+     * Run a tool and return a list of LocationResult objects. Used by
+     * PipelineExecutor for PRIMARY and SECONDARY steps.
      */
     public List<LocationResult> runList(String toolName, Map<String, Object> args) {
-        log.info("🔧 runList: tool={}", toolName);
+        log.info("[Manual Info]runList: tool={}", toolName);
         // Wire to your existing tool execution logic
         // Example — adapt to match your actual tool dispatch:
         try {
@@ -513,7 +568,7 @@ public class MCPClientService {
     }
 
     public String runDetail(String toolName, Map<String, Object> args) {
-        log.info("🔧 runDetail: tool={}", toolName);
+        log.info("[Manual Info]runDetail: tool={}", toolName);
         try {
             return callTool(toolName, args);
         } catch (Exception e) {
@@ -524,10 +579,13 @@ public class MCPClientService {
 
     private List<LocationResult> parseToLocationResults(String raw) {
         List<LocationResult> results = new ArrayList<>();
-        if (raw == null || raw.trim().isEmpty()) return results;
+        if (raw == null || raw.trim().isEmpty()) {
+            return results;
+        }
         // Wire to your existing result parsing — 
         // if callTool already returns structured data via another path,
         // use that instead
         return results;
     }
+  
 }

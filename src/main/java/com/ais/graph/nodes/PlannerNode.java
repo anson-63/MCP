@@ -14,32 +14,32 @@ public class PlannerNode implements GraphNode {
 
     private static final Logger log = LoggerFactory.getLogger(PlannerNode.class);
 
-    // We reuse OllamaService's keyword extraction
-    // since QueryPlanner needs ExtractedKeywords not a String
-    private final OllamaService  ollamaService;
-    private final QueryPlanner   queryPlanner;
+    private final OllamaService ollamaService;
+    private final QueryPlanner queryPlanner;
 
     public PlannerNode(QueryPlanner queryPlanner) {
-        // QueryPlanner constructor - check if it needs OllamaService
-        this.queryPlanner  = queryPlanner;
-        this.ollamaService = null; // set via setter if needed
+        this.queryPlanner = queryPlanner;
+        this.ollamaService = null;
+    }
+
+    public PlannerNode(OllamaService ollamaService, QueryPlanner queryPlanner) {
+        this.ollamaService = ollamaService;
+        this.queryPlanner = queryPlanner;
     }
 
     @Override
     public GraphState process(GraphState state) {
-        log.info("[PlannerNode] Planning for: {}", state.getUserQuery());
+        log.info("[Manual Info][PlannerNode] Planning for: {}", state.getUserQuery());
 
         try {
-            // ── Simple intent detection from query text ─────────
+            // Simple intent detection from query text.
             // The real planning happens inside OllamaService.invoke()
             // which calls QueryPlanner internally.
-            // Here we just set a rough intent for routing/logging.
             String intent = detectIntent(state.getUserQuery());
             state.setDetectedIntent(intent);
             state.setPlannedTools(new ArrayList<>());
 
-            log.info("[PlannerNode] Detected intent: {}", intent);
-
+            log.info("[Manual Info][PlannerNode] Detected intent: {}", intent);
         } catch (Exception e) {
             log.warn("[PlannerNode] Planning error: {}", e.getMessage());
             state.setDetectedIntent("GENERAL");
@@ -50,19 +50,21 @@ public class PlannerNode implements GraphNode {
     }
 
     private String detectIntent(String query) {
-        if (query == null) return "UNKNOWN";
+        if (query == null) {
+            return "UNKNOWN";
+        }
         String q = query.toUpperCase();
 
         // Check for location code pattern (e.g. SB04400361000)
         if (query.matches(".*\\b[A-Z]{2}\\d{5,}\\d*\\b.*")) {
-            if (q.contains("BSI") || q.contains("KAI") ||
-                q.contains("DSSR") || q.contains("EMMS") ||
-                q.contains("CSR")) {
+            if (q.contains("BSI") || q.contains("KAI")
+                    || q.contains("DSSR") || q.contains("EMMS")
+                    || q.contains("CSR")) {
                 return "REPORT";
             }
-            if (q.contains("HISTORY") || q.contains("OLD") ||
-                q.contains("NEW CODE") || q.contains("CURRENT CODE") ||
-                q.contains("FORMER")) {
+            if (q.contains("HISTORY") || q.contains("OLD")
+                    || q.contains("NEW CODE") || q.contains("CURRENT CODE")
+                    || q.contains("FORMER")) {
                 return "CODE_HISTORY";
             }
             return "LOCATION_CODE";
@@ -74,24 +76,28 @@ public class PlannerNode implements GraphNode {
         }
 
         // Historic / monument
-        if (q.contains("MONUMENT")) return "MONUMENT";
-        if (q.contains("HISTORIC") || q.contains("GRADE")) return "HISTORIC";
+        if (q.contains("MONUMENT")) {
+            return "MONUMENT";
+        }
+        if (q.contains("HISTORIC") || q.contains("GRADE")) {
+            return "HISTORIC";
+        }
 
         // Department
-        if (q.contains("LCSD") || q.contains("AFCD") ||
-            q.contains("HD") || q.contains("DSD")) {
+        if (q.contains("LCSD") || q.contains("AFCD")
+                || q.contains("HD") || q.contains("DSD")) {
             return "DEPARTMENT";
         }
 
         // SQL/aggregate queries
-        if (q.contains("HOW MANY") || q.contains("WHICH") ||
-            q.contains("ALL REPORTS") || q.contains("ALL 5")) {
+        if (q.contains("HOW MANY") || q.contains("WHICH")
+                || q.contains("ALL REPORTS") || q.contains("ALL 5")) {
             return "SQL_QUERY";
         }
 
         // Name search
-        if (q.contains("SEARCH") || q.contains("FIND") ||
-            q.contains("LOOK UP")) {
+        if (q.contains("SEARCH") || q.contains("FIND")
+                || q.contains("LOOK UP")) {
             return "NAME_SEARCH";
         }
 
