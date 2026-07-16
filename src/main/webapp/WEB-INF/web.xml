@@ -1,15 +1,51 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <web-app xmlns="http://xmlns.jcp.org/xml/ns/javaee"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://xmlns.jcp.org/xml/ns/javaee 
-         http://xmlns.jcp.org/xml/ns/javaee/web-app_4_0.xsd"
+         xsi:schemaLocation="http://xmlns.jcp.org/xml/ns/javaee
+                             http://xmlns.jcp.org/xml/ns/javaee/web-app_4_0.xsd"
          version="4.0"
          metadata-complete="false">
 
     <display-name>AIS Web</display-name>
 
+    <!-- Register AuthenticationFilter here only. Do not also add @WebFilter. -->
+    <filter>
+        <filter-name>authenticationFilter</filter-name>
+        <filter-class>com.ais.security.AuthenticationFilter</filter-class>
+        <async-supported>true</async-supported>
+    </filter>
+
+    <!-- Protect all API endpoints before a servlet, LLM, tool, or DB call. -->
+    <filter-mapping>
+        <filter-name>authenticationFilter</filter-name>
+        <url-pattern>/api/*</url-pattern>
+        <dispatcher>REQUEST</dispatcher>
+    </filter-mapping>
+
+    <!-- Prevent users from bypassing chat authorization with a direct URL. -->
+    <filter-mapping>
+        <filter-name>authenticationFilter</filter-name>
+        <url-pattern>/report/*</url-pattern>
+        <dispatcher>REQUEST</dispatcher>
+    </filter-mapping>
+
     <welcome-file-list>
         <welcome-file>jsp/index.jsp</welcome-file>
     </welcome-file-list>
+
+    <!-- Local-development authentication. Use HTTPS and enterprise SSO/Realm
+         instead of BASIC authentication for production. -->
+    <login-config>
+        <auth-method>BASIC</auth-method>
+        <realm-name>AIS Assistant</realm-name>
+    </login-config>
+
+    <!-- Role names are case-sensitive and must match tomcat-users.xml/SSO. -->
+    <security-role>
+        <role-name>AIS_USER</role-name>
+    </security-role>
+    <security-role>
+        <role-name>AIS_ADMIN</role-name>
+    </security-role>
 
 </web-app>

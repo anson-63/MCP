@@ -9,6 +9,7 @@ For project overview, tech stack, and architecture, see **[README.md](README.md)
 - [Features](#features)
 - [Prerequisites](#prerequisites)
 - [Run locally](#run-locally)
+- [Signing in and roles](#signing-in-and-roles)
 - [Using the app](#using-the-app)
 - [Sample prompts](#sample-prompts)
 - [Sample interactions](#sample-interactions)
@@ -17,33 +18,47 @@ For project overview, tech stack, and architecture, see **[README.md](README.md)
 
 ## Features
 
-- Chat-based location and report query interface.
+- Authenticated chat-based location and report query interface. API and report routes require an `AIS_USER` or `AIS_ADMIN` identity; database-schema access is restricted to `AIS_ADMIN`.
 - Search by exact location code (for example, `SB04400361000`) with auto-fallback to name search when input is not a valid code.
 - Search by location name or partial text.
 - **`/skill` tools list**: quick-access tools are hidden by default and reveal a ranked, numbered list above the chat input the moment the user types `/skill` (optionally followed by a search term, e.g. `/skill historic`). Navigate with `↑`/`↓`, apply the highlighted tool with `Tab`/`Enter`, or click a row directly.
 - Natural language prompt detection for conversational or multi-step queries.
 - Session memory for multi-code follow-up queries such as "which have BSI report" and "how about KAI?".
 - Deterministic query planning for PSM, department, monument, historic building, report checks, and code-history requests.
-- **Scalable plan execution**: the LLM returns an ordered `plan` array with priorities and generic relations; `OllamaService.executePlan()` applies `filter_previous`, `enrich_previous`, and `use_previous_codes` generically without hardcoding every intent combination.
+- **Scalable plan execution**: the LLM returns an ordered `plan` array with priorities and generic relations; `QueryPlanner` validates the catalog-supported relations and `OllamaService.executePlan()` applies `filter_previous`, `enrich_previous`, and `use_previous_codes` generically without hardcoding every intent combination.
+- **Catalog-driven tools**: registered tools expose their descriptions, parameters, supported relations, and UI prompts through one shared catalog. New standard tools automatically become available to the agent and `/skill` list without frontend changes.
+- **Composed location queries**: compatible filters such as department, PSM, location/area, historic grade, monument status, location codes, and required reports can be executed through the database-side `location_query` path instead of fetching separate result sets and intersecting limited pages in Java. Non-compatible requests still use the generic relation fallback.
 - Search by department, declared monument status, historic building grade, or code history.
-- **Area/district filtering**: Optional `location` filter support for department, PSM, monument, and historic building queries (e.g., *"Which LCSD location in Sha Tin has BSI and KAI reports?"*), automatically scoping queries before bulk checking reports.
-- **Sortable & filterable report lists**: Check report availability for multiple location codes or names with grouped `withReport` / `withoutReport` output rendered as clean HTML tables (`<table class='data-table'>`), enabling UI frontend table widgets (sorting, instant search/filtering, and pagination). Includes dynamic splitting for multi-report requests (e.g., `"ALL"` or `"BSI,KAI"`).
+- **Area/district filtering**: Optional `location` filter support for department, PSM, monument, historic building, and composed location queries (e.g., *"Which LCSD location in Sha Tin has BSI and KAI reports?"*), allowing the database to scope compatible filters before returning results.
+- **Sortable & filterable report lists**: Check report availability for multiple location codes or names with grouped `withReport` / `withoutReport` output rendered as clean HTML tables (`<table class='data-table'>`), enabling UI frontend table widgets (sorting, instant search/filtering, and pagination). `check_reports` accepts registered availability types (`BSI`, `CSR`, `KAI`, `EMMS`, `DSSR`), comma-separated values such as `BSI,KAI`, and the virtual `ALL` aggregate. Multi-report responses are grouped under `checks`; compatible location filters use `location_query`.
 - Display results as formatted HTML tables in the chat view, featuring dynamic column headers for custom LLM queries. Preserves decommissioned/dummy records (`REC_STATUS: D`, `***`) for complete audit compliance.
 - Show available report cards with links to open report details.
 - Clickable location code links in result tables that open the AIS Asset Search detail page (`/AIS/AssetSearch/index.jsp`), automatically passing the correct `assetType` (`Building` or `Slope`).
 - **Sticky location map**: on a single-location detail card, the map `<iframe>` renders as a separate div positioned to the right of the message bubble (not nested inside it) and stays pinned near the top of the viewport while the user scrolls the result content — but never above the message's own top or past its bottom. Collapses to a stacked layout on narrow screens.
-- Database schema inspection endpoint, including schema refresh support.
+- Administrator-only database schema inspection endpoint (`AIS_ADMIN` required). Both GET and POST schema requests are checked by the servlet filter and by `LocationServlet` itself.
+- Final assistant HTML is sanitized before it is returned to the browser, so unsupported tags, scripts, event handlers, and unsafe URL schemes are removed.
 - LLM-driven tool-based responses via Tencent Cloud or Ollama, including TMCP/TMIS, PSM usage, and SQL query generation for complex questions.
-- **LangGraph-style response verification: every answer is checked by a second LLM call before being shown to the user, with automatic retry on failure.**
+- **LangGraph-style response verification: every answer is checked by a second LLM call before being shown to the user.** When the verifier identifies a specific missing database check, the system can perform a bounded catalog-validated repair and verify the patched response again; otherwise it regenerates the answer normally. Repaired data is dynamically formatted into beautiful HTML tables and collapsed under a "📋 Show additional verified data" accordion by default to keep the chat interface clean and compact.
 - "Oldest" / "newest" comparison questions (e.g. *"What is the oldest historic building on record?"*) are answered with a single batched database lookup across all candidates rather than fetching each candidate's full detail one at a time, so these questions return in a few seconds even when there are 100+ candidates to compare.
 - **Row-limit control**: add `top N` or `first N` to any PSM, department, monument, historic building, or name-search prompt (e.g. *"Show top 50 locations under PSM/KT"*) to cap the number of results returned, instead of always fetching the default page size.
-- **Scalable LLM-driven placeholder exclusion**: add any natural language filter like *"with address not null"*, *"with a real address"*, *"valid name"*, or *"with address not undefined"* to exclude decommissioned/placeholder records whose address, name, or department is missing, blank, `-`, or literally the text "UNDEFINED". The LLM semantic engine automatically detects and applies this filter across all search tools without relying on rigid prompt-trapping patterns.
+- **Scalable LLM-driven placeholder exclusion**: add a natural-language request such as *"with address not null"*, *"with a real address"*, *"valid name"*, or *"with address not undefined"*. The structured keyword result carries the canonical field, and the database whitelist applies it without adding a prompt-regex rule for each tool.
+
+
+## Recent behavior and map/report notes
+
+- Security enforcement is enabled by default (`security.enabled=true`). All endpoints (chat, tools, location, reports, and schema) are protected fail-closed under `AuthenticationFilter` and servlet RBAC checks.
+- Compound location filters now normally execute as one composed database query. Results include only rows satisfying every requested canonical condition.
+- A multi-report request such as `Check BSI,KAI reports for AB01900272000 and AA04400176009` displays separate BSI and KAI availability sections. Each available report includes its own Open Report link.
+- Multiple location details use one map panel with a tab for each location code. Selecting a tab changes the active map.
+- The map panel always displays the location code it received. If the ArcGIS service is unreachable, unauthenticated, or has no matching feature, the blank iframe is replaced by a readable status message naming the code.
+- Internal ArcGIS services may require corporate network/VPN and integrated authentication. Users must not enter ArcGIS credentials into chat.
+- A successful zero-row result is a valid answer and should not trigger unrelated retries.
 
 ## Prerequisites
 
 - Java 8 (`maven.compiler.source` and `maven.compiler.target` set to `1.8`).
 - Apache Maven 3.8+.
-- Apache Tomcat 9 (Servlet API 4.0, JSP API 2.3).
+- Apache Tomcat 9 (Servlet API 4.0, JSP API 2.3), with a configured Tomcat Realm/user account for local authentication. The active Realm must provide `AIS_USER` and `AIS_ADMIN` roles.
 - SQL Server database accessible from your machine.
 - **Either** a Tencent Cloud API key (`tencent.api.key` in `application.properties`) **or** Ollama installed and reachable at the URL configured in `application.properties`.
 - If using Tencent Cloud: a valid model name such as `deepseek-v4-flash`, `deepseek-v3`, or `deepseek-r1`.
@@ -51,36 +66,115 @@ For project overview, tech stack, and architecture, see **[README.md](README.md)
 
 ## Run locally
 
-1. Build the project:
+1. Build the project. The Java 8-compatible OWASP HTML Sanitizer dependency is resolved automatically by Maven:
 
 ```bash
 mvn clean package
 ```
 
+A successful build must include the sanitizer dependency in the generated WAR.
+
 2. Copy `target/ais_ai.war` to your Tomcat 9 `webapps/` directory.
 
-3. Open the web UI at:
+3. Configure local Tomcat users in the active `$CATALINA_BASE/conf/tomcat-users.xml` (Windows: `%CATALINA_BASE%\conf\tomcat-users.xml`). Eclipse may use a separate workspace server configuration; use the `Using CATALINA_BASE` path shown in the Tomcat console.
+
+4. Fully restart Tomcat after changing users/roles. Confirm an `AIS_USER` receives `403` for `/api/location/schema` and an `AIS_ADMIN` receives `200`, then open:
 
 ```
 http://localhost:8090/ais_ai/
 ```
 
+## Signing in and roles
+
+Local development uses the browser's HTTP BASIC authentication prompt. Production should use the organization's SSO/LDAP/OIDC login instead.
+
+Tomcat reads users from its active server configuration—not from a file inside the application project. A local administrator can merge entries like these into `$CATALINA_BASE/conf/tomcat-users.xml`, replace the passwords, and fully restart Tomcat:
+
+```xml
+<role rolename="AIS_USER"/>
+<role rolename="AIS_ADMIN"/>
+<user username="ais-user"
+      password="REPLACE_WITH_A_STRONG_LOCAL_PASSWORD"
+      roles="AIS_USER"/>
+<user username="ais-admin"
+      password="REPLACE_WITH_A_DIFFERENT_STRONG_PASSWORD"
+      roles="AIS_USER,AIS_ADMIN"/>
+```
+
+| Role | Access |
+|---|---|
+| `AIS_USER` | Chat, tools list, general location information, and report views |
+| `AIS_ADMIN` | All normal user access plus `/api/location/schema` |
+
+The schema restriction is enforced twice: the application authentication filter protects the route, and `LocationServlet` checks `AIS_ADMIN` again before calling `introspectSchema()`. A normal user receives HTTP `403`; an administrator receives the schema response.
+
+The main JSP can load before its protected API requests. If no login dialog appears, open this URL directly once and enter your local Tomcat credentials:
+
+```
+http://localhost:8090/ais_ai/api/tools
+```
+
+Then return to the main page. For command-line testing:
+
+```bash
+curl -i -u 'ais-user:YOUR_LOCAL_PASSWORD' \
+  http://localhost:8090/ais_ai/api/tools
+```
+
+Expected statuses:
+
+- `200` — login and role succeeded.
+- `401` — Tomcat rejected the username/password. Check the active `CATALINA_BASE`, exact password, `tomcat-users.xml`, and restart Tomcat.
+- `403` — login succeeded, but the account lacks the route's required role.
+
+A repeating login prompt plus `curl -u` returning `401` is a Tomcat credential/Realm problem, not a chat application problem. After repeated failures, restart Tomcat to clear a possible temporary `LockOutRealm` lock and use a private browser window to avoid cached failed BASIC credentials.
+
+Never use local BASIC credentials over plain HTTP outside a development machine, and never commit real passwords.
+
 ## Using the app
 
 1. Open the web UI.
-2. Enter a location code such as `SB04400361000`, a comma-separated list like `SB04400361000,SB04400362000`, or a location name like `Sha Tin Park`.
-3. The assistant will:
+2. Sign in with an account assigned `AIS_USER` or `AIS_ADMIN`. If the browser does not prompt, open `/ais_ai/api/tools` directly first as described above.
+3. Enter a location code such as `SB04400361000`, a comma-separated list like `SB04400361000,SB04400362000`, or a location name like `Sha Tin Park`.
+4. The assistant will:
    - run the query through the verification graph,
    - decide which tool to call or whether to generate custom SQL,
    - query the database,
    - verify the response with a second LLM call (Tencent Cloud or Ollama),
    - display a formatted result table.
-4. Type `/skill` in the chat input to reveal the ranked tools list, then click a row (or navigate with `↑`/`↓` and press `Tab`/`Enter`) to insert that tool's full sample prompt for editing before sending.
-5. Click any location code in the result table to open the AIS Asset Search detail page for that location.
-6. If related reports exist, it will show report cards with links.
-7. When viewing a single location's details, the map appears in a sticky panel to the right of the message so it stays visible while you scroll through the result data.
+5. Type `/skill` in the chat input to reveal the ranked tools list, then click a row (or navigate with `↑`/`↓` and press `Tab`/`Enter`) to insert that tool's full sample prompt for editing before sending.
+6. Click any location code in the result table to open the AIS Asset Search detail page for that location.
+7. If related reports exist, it will show report cards with links.
+8. When viewing a single location's details, the map appears in a sticky panel to the right of the message so it stays visible while you scroll through the result data.
+
+### Tool discovery
+
+The assistant discovers available tools from the server catalog. Type `/skill` to search the current tool list; registered tools provide their own descriptions and sample prompts. The tool list may grow as the application is extended, so the visible options can differ between deployments.
+
+For multi-step questions, the assistant uses generic relationships between results. For example, it can first find department locations, pass their location codes to a report check, and then narrow or enrich the result without requiring a separate user action.
 
 ## Sample prompts
+
+### Composed-query and report-link examples
+
+```text
+Find all historic buildings under PSM/CENTRAL that have both BSI and KAI reports. Return only locations satisfying every condition.
+```
+
+Expected: one composed query and a location list; no automatic full-detail lookup for the first row.
+
+```text
+Check BSI,KAI reports for AB01900272000 and AA04400176009. Show each report link separately.
+```
+
+Expected: separate BSI and KAI sections with available links.
+
+```text
+Show details and map options for AB01900272000 and AA04400176009.
+```
+
+Expected: both detail sections and one tabbed map panel.
+
 
 <details>
 <summary><strong>Direct location lookup</strong></summary>
@@ -132,7 +226,8 @@ http://localhost:8090/ais_ai/
 | `which of these have BSI report: AA00200081000 BB04400174001 RB01800059000` | detect report type + extract codes → `check_reports(reportType=BSI, locCds=[...])` |
 | `show KAI report for SB04400361000 SC04400206005` | detect report type + extract codes → `check_reports(reportType=KAI, locCds=[...])` |
 | `check DSSR for SB04400361000, SC04400206005` | detect report type + extract codes → `check_reports(reportType=DSSR, locCds=[...])` |
-| `check all 5 reports for QA03206005000 QB03106003000` | detect `ALL` reports + extract codes → `check_reports(BSI)` + `check_reports(CSR)` + `check_reports(KAI)` + `check_reports(EMMS)` + `check_reports(DSSR)` |
+| `Check BSI and KAI reports for SC04400168007` | extract the code → `check_reports(reportType=BSI,KAI, locCds=[SC04400168007])` → grouped per-report checks |
+| `check all 5 reports for QA03206005000 QB03106003000` | extract codes → `check_reports(reportType=ALL, locCds=[...])` → registry expands `ALL` into the registered availability checks under `checks` |
 
 </details>
 
@@ -157,7 +252,7 @@ http://localhost:8090/ais_ai/
 | `Show top 50 locations under PSM/KT` | `locations_by_psm(psm="PSM/KT", limit=50)` — caps the query itself to 50 rows instead of fetching the default and trimming display |
 | `Show locations under PSM/KT with address not undefined` | `locations_by_psm(psm="PSM/KT", excludeUndefinedField="address")` — excludes decommissioned/placeholder records with no real address |
 | `Show top 20 locations under PSM/KT with address not undefined` | `locations_by_psm(psm="PSM/KT", limit=20, excludeUndefinedField="address")` — both filters combine |
-| `Show first 50 locations under PSM central with address not null` | `locations_by_psm(psm="CENTRAL", limit=50, excludeUndefinedField="address")` — LLM natively extracts limit and filter without rigid prompt trapping, propagating across all plan steps |
+| `Show first 50 locations under PSM central with address not null` | `locations_by_psm(psm="CENTRAL", limit=50, excludeUndefinedField="address")` — structured keyword extraction supplies the canonical limit and field; the database clamps and validates both |
 
 </details>
 
@@ -169,7 +264,7 @@ http://localhost:8090/ais_ai/
 | Sample prompt | Procedure |
 |---|---|
 | `Get info for first location code under PSM/KT` | `locations_by_psm(psm="PSM/KT")` → take first `LOC_CD` from results (including decommissioned entries) → `hardcode_query(locCd=firstCode)` |
-| `Which locations under PSM/KT have BSI report?` | `locations_by_psm(psm="PSM/KT")` → extract all `LOC_CD` → `check_reports(reportType=BSI, locCds=[...])` |
+| `Which locations under PSM/KT have BSI report?` | Prefer `location_query(psm="PSM/KT", reportType="BSI")`; use `locations_by_psm` plus `check_reports` when the planner keeps the request as a generic relation chain. |
 | `Show first location under PSM/SHEUNG SHUI` | `locations_by_psm(psm="PSM/SHEUNG SHUI")` → take first `LOC_CD` from results → `hardcode_query(locCd=firstCode)` |
 
 </details>
@@ -195,9 +290,9 @@ http://localhost:8090/ais_ai/
 
 | Sample prompt | Procedure |
 |---|---|
-| `Which AFCD locations have BSI report?` | `locations_by_dept(deptCd=AFCD)` → extract all `LOC_CD` → `check_reports(reportType=BSI, locCds=[...])` |
-| `Show LCSD locations with KAI report` | `locations_by_dept(deptCd=LCSD)` → extract all `LOC_CD` → `check_reports(reportType=KAI, locCds=[...])` |
-| `Which LCSD location in Sha Tin has BSI and KAI reports?` | `locations_by_dept(deptCd="LCSD", location="Sha Tin")` → extract matched codes → `check_reports(reportType=BSI)` + `check_reports(reportType=KAI)` |
+| `Which AFCD locations have BSI report?` | Prefer `location_query(deptCd=AFCD, reportType="BSI")`; the generic relation chain remains available for non-collapsible plans. |
+| `Show LCSD locations with KAI report` | Prefer `location_query(deptCd=LCSD, reportType="KAI")`; the generic relation chain remains available for non-collapsible plans. |
+| `Which LCSD location in Sha Tin has BSI and KAI reports?` | Prefer one composed `location_query(deptCd="LCSD", location="Sha Tin", reportType="BSI,KAI")`; the generic relation path remains available when the plan is not collapsible. |
 | `Show department managing UC07300217003` | Pre-validation detects `deptCd` is null → `needsLlm=true` → Agent loop / SQL Gen → `hardcode_query(UC07300217003)` / SELECT DEPT_CD |
 | `show managing department of lo wu` | Pre-validation detects `deptCd` is null → `needsLlm=true` → SQL Gen → SELECT LOC_CD, LOC_NAME, DEPT_CD WHERE LOC_NAME LIKE '%LO WU%' → Dynamic Table |
 
@@ -233,6 +328,7 @@ http://localhost:8090/ais_ai/
 | `show historic buildings grade NONE` | `search_historic_building(grade=NONE)` |
 | `show graded buildings only` | `search_historic_building(grade=ALL)` + enrich_previous with `gradeFilter=GRADED` |
 | `list graded buildings` | `search_historic_building(grade=ALL)` |
+| `Show historic buildings under PSM/KT` | Prefer `location_query(psm="KT", grade="ALL")`; if the requested semantics are not represented by the canonical dimensions, use a generic `filter_previous` relation. |
 
 </details>
 
@@ -266,7 +362,9 @@ http://localhost:8090/ais_ai/
 ---
 
 <details>
-<summary><strong>Schema queries</strong></summary>
+<summary><strong>Schema queries (AIS_ADMIN only)</strong></summary>
+
+> Schema introspection is restricted to authenticated administrators. An `AIS_USER` receives HTTP `403`.
 
 | Sample prompt | Procedure |
 |---|---|
@@ -285,8 +383,8 @@ http://localhost:8090/ais_ai/
 |---|---|
 | `Which playground in Lo Wu has a historic status?` | planner detects complex query → LLM/agent planning → likely `search_historic_building(...)` + `search_by_name("Lo Wu")` + result filtering/comparison |
 | `Which department manages the oldest historic monument in Lo Wu?` | planner detects complex comparative query → LLM/agent planning → likely `search_declared_monument(...)` + `search_historic_building(...)` + location/name filtering + department inference |
-| `Find the first historic location under PSM/KT and show its details` | LLM plan: `PSM_LOCATIONS` (priority 1, `independent`) → `HISTORIC_BUILDING` (priority 2, `filter_previous`, `modifier=FIRST`) → `hardcode_query(firstMatch)` |
-| `Which LCSD location in Sha Tin has BSI and KAI reports?` | planner detects multi-intent → SQL generation → SELECT with DEPT_CD + location + EXISTS subqueries for both report types |
+| `Find the first historic location under PSM/KT and show its details` | Prefer `location_query(psm="KT", grade="ALL")`, then apply the explicit `FIRST` modifier to the resulting codes and fetch the selected detail; use the generic relation path if the plan cannot be collapsed. |
+| `Which LCSD location in Sha Tin has BSI and KAI reports?` | Prefer `location_query(deptCd="LCSD", location="Sha Tin", reportType="BSI,KAI")`, which uses trusted `EXISTS` predicates for both report types; SQL generation remains a fallback for unsupported semantics. |
 
 </details>
 

@@ -35,7 +35,7 @@ public class AppConfig {
                 java.io.File f = new java.io.File(externalPath);
                 if (f.exists()) {
                     is = new java.io.FileInputStream(f);
-                    log.info("[Manual Info]✅ Loading EXTERNAL config: {}", externalPath);
+                    log.info("[Manual Info]Loading EXTERNAL config: {}", externalPath);
                 }
             }
 
@@ -43,7 +43,7 @@ public class AppConfig {
             if (is == null) {
                 is = AppConfig.class.getClassLoader()
                         .getResourceAsStream("application.properties");
-                log.info("[Manual Info]✅ Loading classpath config");
+                log.info("[Manual Info]Loading classpath config");
             }
 
             if (is == null) {
@@ -113,6 +113,7 @@ public class AppConfig {
         loadIfNeeded();
         String val = props.getProperty(key);
         if (val == null) {
+            log.warn("{} is null", key);
             return defaultValue;
         }
         return Boolean.parseBoolean(val.trim());
@@ -124,7 +125,7 @@ public class AppConfig {
 
     public static String getTencentBaseUrl() {
         return get("tencent.api.base_url",
-                "https://domain");
+                "https://api.lkeap.cloud.tencent.com/v1");
     }
 
     public static String getTencentModel() {
@@ -173,6 +174,10 @@ public class AppConfig {
         return getInt("db.connection_timeout", 30000);
     }
 
+    public static int dbQueryTimeout() {
+        return getInt("db.query_timeout_seconds", 30);
+    }
+
     public static String ollamaBaseUrl() {
         return get("ollama.base_url", "http://localhost:11434");
     } //hardcode default
@@ -209,4 +214,31 @@ public class AppConfig {
     public static String reportDssrBase() {
         return get("report.url.dssr_base", "http://domain/asdiis/sebiis/2k/application/dssr/reportmain.aspx");
     } //hardcode default
+
+    public static boolean isSecurityEnabled() {
+        // Default to true if the property is missing
+        boolean enabled = getBoolean("security.enabled", true);
+        log.debug("[Debug] isSecurityEnabled {}", enabled);
+        return enabled;
+    }
+
+    public static int graphMaxRegenerations() {
+        return getInt("graph.max_regenerations", 1);
+    }
+
+    public static int graphMaxRepairAttempts() {
+        return getInt("graph.max_repair_attempts", 1);
+    }
+
+    public static int agentLoopMaxIterations() {
+        return getInt("agent.loop.max_iterations", 3);
+    }
+
+    public static int agentLoopTimeoutMs() {
+        return getInt("agent.loop.timeout_ms", 15000);
+    }
+
+    public static int dbQueryTimeoutSeconds() {
+        return getInt("db.query_timeout_seconds", 15);
+    }
 }

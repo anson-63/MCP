@@ -6,15 +6,15 @@ import com.ais.service.OllamaService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
+/**
+ * Runs the primary LLM pipeline and preserves per-request tool-call audit
+ * records across targeted repairs and bounded full retries.
+ */
 public class PrimaryLlmNode implements GraphNode {
 
     private static final Logger log = LoggerFactory.getLogger(PrimaryLlmNode.class);
-
     private final OllamaService ollamaService;
 
     public PrimaryLlmNode(OllamaService ollamaService) {
@@ -23,74 +23,60 @@ public class PrimaryLlmNode implements GraphNode {
 
     @Override
     public GraphState process(GraphState state) {
-        int attempt = state.getRetryCount() + 1;
-        log.info("[Manual Info][PrimaryLlmNode] Generating response (attempt {})", attempt);
+        int attempt = state.getRegenerationCount() + 1;
+        log.info("[PrimaryLlmNode] Generating response (attempt {})", attempt);
 
         try {
-            String prompt = buildPrompt(state);
+            state.setToolCallDetails(new ArrayList<Map<String, Object>>());
+            state.setRawToolOutput("");
 
-            // Use invoke() which is the real method
-            OllamaService.AgentResult result
-                    = ollamaService.invoke(prompt, state.getSessionId());
+            OllamaService.AgentResult result = ollamaService.invoke(
+                    state.getUserQuery(),
+                    state.getSessionId(),
+                    state.getAuthorizationContext());
 
-            // Extract answer
-            String responseText = result.getAnswer();
-            if (responseText == null || responseText.isEmpty()) {
-                responseText = "No response generated.";
-            }
+            String responseText = result.getAnswer() != null && !result.getAnswer().isEmpty()
+                    ? result.getAnswer() : "No response generated.";
             state.setPrimaryResponse(responseText);
-
-            // Extract tool metadata
-            try {
-                state.setToolCallsMade(result.getToolNames());
-            } catch (Exception e) {
-                log.warn("[PrimaryLlmNode] Could not get tool names: {}", e.getMessage());
-                state.setToolCallsMade(new ArrayList<>());
-            }
-            try {
-                state.setRawToolOutput(result.getToolSummary());
-            } catch (Exception e) {
-                log.warn("[PrimaryLlmNode] Could not get tool summary: {}", e.getMessage());
-                state.setRawToolOutput("");
-            }
-            
-            try {
-                List<Map<String, Object>> details = new ArrayList<>();
-                for (OllamaService.AgentResult.ToolCallRecord record : result.getToolCalls()) {
-                    Map<String, Object> entry = new LinkedHashMap<>();
-                    entry.put("name", record.getToolName());
-                    entry.put("args", record.getArgs() != null
-                            ? record.getArgs() : new LinkedHashMap<String, Object>());
-                    entry.put("result", record.getOutput() != null
-                            ? record.getOutput() : "");
-                    details.add(entry);
-                }
-                state.setToolCallDetails(details);
-                log.info("[Manual Info][PrimaryLlmNode] Captured {} individual tool-call record(s)",
-                        details.size());
-            } catch (Exception e) {
-                log.warn("[PrimaryLlmNode] Could not build tool call details: {}", e.getMessage());
-                state.setToolCallDetails(new ArrayList<>());
-            }
-            
-            log.info("[Manual Info][PrimaryLlmNode] Got response ({} chars)", responseText.length());
+            updateToolState(state, result);
+            log.info("[PrimaryLlmNode] Got response ({} chars)", responseText.length());
         } catch (Exception e) {
             log.error("[PrimaryLlmNode] LLM call failed: {}", e.getMessage(), e);
             state.setPrimaryResponse("I encountered an error processing your request.");
             state.setErrorMessage(e.getMessage());
         }
-
         return state;
     }
 
-    private String buildPrompt(GraphState state) {
-        if (state.getRetryCount() == 0) {
-            return state.getUserQuery();
+    private void updateToolState(GraphState state, OllamaService.AgentResult result) {
+        // Update tool names list
+        if (result.getToolNames() != null) {
+            state.getToolCallsMade().addAll(result.getToolNames());
         }
-        // On retry, tell the LLM what was wrong
-        return state.getUserQuery()
-                + "\n\n[Previous answer was flagged: "
-                + state.getVerificationReason()
-                + ". Please provide a more accurate response.]";
+
+        // Update raw tool output summary
+        if (result.getToolSummary() != null && !result.getToolSummary().isEmpty()) {
+            String old = state.getRawToolOutput();
+            state.setRawToolOutput((old == null || old.isEmpty()) ? result.getToolSummary() : old + "\n---\n" + result.getToolSummary());
+        }
+
+        // Append detailed records
+        List<Map<String, Object>> details = state.getToolCallDetails();
+        for (OllamaService.AgentResult.ToolCallRecord record : result.getToolCalls()) {
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("name", record.getToolName());
+            entry.put("args", record.getArgs() != null ? record.getArgs() : Collections.emptyMap());
+            entry.put("result", record.getOutput() != null ? record.getOutput() : "");
+            details.add(entry);
+        }
+
+        log.info("[Manual Info][PrimaryLlmNode] Captured {} tool-call record(s)", result.getToolCalls().size());
+    }
+
+    private String buildPrompt(GraphState state) {
+        if (state.getRetryCount() == 0) return state.getUserQuery();
+
+        return String.format("%s\n\n[Previous answer was flagged: %s. Please provide a more accurate response.]",
+                state.getUserQuery(), state.getVerificationReason());
     }
 }

@@ -328,32 +328,70 @@ quickPrompts.addEventListener('click', (e) => {
 // backend needs to do; everything else (positioning it beside the
 // message instead of inside it) happens here on the client.
 function extractMapBlock(messageDiv) {
-    // querySelectorAll (not querySelector): a single response can contain
-    // more than one .location-map-block — e.g. when the verifier flags a
-    // response and OllamaService renders both the original answer AND a
-    // "Best available answer" fallback card, each with its own AIS link
-    // + map iframe. Using querySelector (singular) only ever found the
-    // FIRST one; the second was silently left behind inside the message
-    // body, unstyled and non-sticky — this was the "one sticky map, one
-    // stray map after the result table" bug.
-    const markers = messageDiv.querySelectorAll('.location-map-block');
-    if (markers.length === 0) return null;
+    const markers = Array.from(messageDiv.querySelectorAll('.location-map-block'));
 
-    // Keep only the first map (it's the one worth showing in the sticky
-    // sidebar); detach and discard any duplicates entirely rather than
-    // leaving them stranded in the message.
-    let kept = null;
-    markers.forEach((marker, i) => {
-        marker.remove(); // detach from the message content entirely
-        if (i === 0) {
-            marker.classList.remove('location-map-block');
-            marker.classList.add('location-map-sticky');
-            kept = marker;
-        }
+    if (markers.length === 0) {
+        return null;
+    }
+
+    markers.forEach(marker => marker.remove());
+
+    // One location: preserve the existing sticky-map behavior.
+    if (markers.length === 1) {
+        const marker = markers[0];
+        marker.classList.remove('location-map-block');
+        marker.classList.add('location-map-sticky');
+        return marker;
+    }
+
+    // Multiple locations: create one sticky wrapper with tabs.
+    const wrapper = document.createElement('div');
+    wrapper.className = 'location-map-sticky location-map-multiple';
+    const controls = document.createElement('div');
+    controls.className = 'location-map-tabs';
+    const panels = document.createElement('div');
+    panels.className = 'location-map-panels';
+	
+    markers.forEach((marker, index) => {
+        marker.classList.remove('location-map-block');
+        marker.classList.add('location-map-panel');
+
+        marker.hidden = index !== 0;
+
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'location-map-tab' + (index === 0 ? ' active' : '');
+        btn.textContent = getLocCdFromIframe(marker.querySelector('iframe')) || `Location ${i + 1}`;
+        button.addEventListener('click',() => {
+                const allButtons = controls.querySelectorAll('.location-map-tab');
+                const allPanels = panels.querySelectorAll('.location-map-panel');
+                allButtons.forEach(item => item.classList.toggle('active', b === btn));
+                allPanels.forEach(item => {item.hidden = p !== marker;});
+            }
+        );
+        controls.appendChild(button);
+        panels.appendChild(marker);
     });
-    return kept;
+
+    wrapper.appendChild(controls);
+    wrapper.appendChild(panels);
+
+    return wrapper;
 }
 
+function getLocCdFromIframe(iframe) {
+    if (!iframe) {
+        return '';
+    }
+
+    try {
+        const url = new URL(iframe.getAttribute('src'),window.location.href);
+        return (url.searchParams.get('locCd') || '').trim().toUpperCase();
+    } catch (error) {
+        console.warn('Could not read iframe location code',error);
+        return '';
+    }
+}
 // ── "No feature" handling for the map iframe ───────────────────────
 // plugin.html (loaded inside the map <iframe>) runs as a separate
 // document, so it can't reach into this page's DOM directly to update
@@ -402,27 +440,49 @@ window.addEventListener('message', (event) => {
     //      iframe are two separate sibling <div>s instead of one
     //      shared block, so extractMapBlock() had nothing to move and
     //      the iframe never got re-parented into .location-map-sticky.
-    const container =
-        iframe.closest('.location-map-sticky') ||
-        iframe.closest('.message-row') ||
-        iframe.closest('.message') ||
-        iframe.parentElement;
-    const btn = container ? container.querySelector('.ais-detail-btn') : null;
+	const panel =
+	    iframe.closest('.location-map-panel')
+	    || iframe.closest('.location-map-sticky')
+	    || iframe.closest('.message-row')
+	    || iframe.closest('.message')
+	    || iframe.parentElement;
+    const btn = panel ? panel.querySelector('.ais-detail-btn') : null;
     if (!btn) {
         console.warn('ais-plugin-map: no .ais-detail-btn found for locCd', data.locCd);
         return;
     }
-
     if (data.status === 'no-feature') {
         // Turn the link into plain, non-clickable status text: drop the
         // redirect entirely (no href) and swap the label.
-        const span = document.createElement('span');
-        span.className = btn.className; // keep existing styling
-        span.textContent = 'No feature';
-        btn.replaceWith(span);
+		if(btn){
+			const span = document.createElement('span');
+			span.className = btn.className; // keep existing styling
+			span.textContent = 'No feature for ' + data.locCd;
+			btn.replaceWith(span);
+		}
+		replaceMapWithStatus(iframe,"No map feature was found for " + data.locCd + ".");
+        
     }
+	
+	if(data.status === 'error'){
+		replaceMapWithStatus(iframe, data.message ||
+			('The map service is unavailable for '
+			+ data.locCd
+			+ '. The location code was received correctly.')
+		);
+	}
     // 'ok' / 'error' statuses currently need no UI change here.
 });
+
+function replaceMapWithStatus(iframe, message){
+	if(!iframe){
+		return;
+	}
+	const status = document.createElement('div');
+	status.className = 'location-map-error';
+	status.textContent = message;
+	iframe.replaceWith(status);
+}
 
 function appendMessage(cls, html) {
     const div = document.createElement('div');

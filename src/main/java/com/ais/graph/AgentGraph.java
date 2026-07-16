@@ -8,60 +8,47 @@ import java.util.Map;
 
 /**
  * Core graph execution engine. Equivalent to LangGraph's StateGraph with
- * .compile() and .invoke().
- *
- * Usage: AgentGraph graph = new AgentGraph() .addNode("planner", plannerNode)
- * .addNode("llm", primaryLlmNode) .addNode("verifier", verifierNode)
- * .addNode("format", formatterNode) .addEdge("planner", "llm") // unconditional
- * .addConditionalEdge("verifier", // conditional state ->
- * state.getVerificationResult() == APPROVED ? "format" : "llm")
- * .setEntryPoint("planner") .compile();
- *
- * GraphState result = graph.invoke(initialState);
+ * compile() and invoke().
  */
 public class AgentGraph {
 
     private static final Logger log = LoggerFactory.getLogger(AgentGraph.class);
+
     private static final String END = "END";
-    private static final int MAX_STEPS = 20; // Circuit breaker
+    private static final int MAX_STEPS = 20;
 
-    // Node registry
     private final Map<String, GraphNode> nodes = new HashMap<>();
-
-    // Edge registry: nodeName -> next node name (unconditional)
     private final Map<String, String> edges = new HashMap<>();
-
-    // Conditional edges: nodeName -> routing function
     private final Map<String, GraphEdge> conditionalEdges = new HashMap<>();
 
     private String entryPoint;
-    private boolean compiled = false;
+    private boolean compiled;
 
-    // ── Builder Methods ───────────────────────────────────────
     public AgentGraph addNode(String name, GraphNode node) {
+        if (name == null || name.trim().isEmpty()) {
+            throw new IllegalArgumentException("node name must not be empty");
+        }
+        if (node == null) {
+            throw new IllegalArgumentException("node must not be null");
+        }
+
         nodes.put(name, node);
         log.debug("Registered node: {}", name);
         return this;
     }
 
-    /**
-     * Unconditional edge: always go from 'from' to 'to'
-     */
     public AgentGraph addEdge(String from, String to) {
         edges.put(from, to);
         return this;
     }
 
-    /**
-     * Conditional edge: routing function decides next node
-     */
     public AgentGraph addConditionalEdge(String from, GraphEdge router) {
         conditionalEdges.put(from, router);
         return this;
     }
 
     public AgentGraph setEntryPoint(String nodeName) {
-        this.entryPoint = nodeName;
+        entryPoint = nodeName;
         return this;
     }
 
@@ -70,44 +57,41 @@ public class AgentGraph {
             throw new IllegalStateException("Entry point not set");
         }
         if (!nodes.containsKey(entryPoint)) {
-            throw new IllegalStateException(
-                    "Entry point node not registered: " + entryPoint);
+            throw new IllegalStateException("Entry point node not registered: " + entryPoint);
         }
-        this.compiled = true;
-        log.info("[Manual Info]Graph compiled. Entry: {}, Nodes: {}",
-                entryPoint, nodes.keySet());
+
+        validateRoutes();
+        compiled = true;
+
+        log.info("[Manual Info] Graph compiled. Entry: {}, Nodes: {}", entryPoint, nodes.keySet());
         return this;
     }
 
-    // ── Execution ─────────────────────────────────────────────
-    /**
-     * Execute the graph with the given initial state. Equivalent to LangGraph's
-     * graph.invoke(state)
-     */
     public GraphState invoke(GraphState initialState) {
         if (!compiled) {
             throw new IllegalStateException("Graph not compiled. Call .compile() first.");
+        }
+        if (initialState == null) {
+            throw new IllegalArgumentException("initialState must not be null");
         }
 
         GraphState state = initialState;
         String currentNodeName = entryPoint;
         int stepCount = 0;
 
-        log.info("[Manual Info]=== Graph Execution Start [Session: {}] ===",
-                state.getSessionId());
+        log.info("[Manual Info] === Graph Execution Start [Session: {}] ===", state.getSessionId());
 
         while (!END.equals(currentNodeName) && stepCount < MAX_STEPS) {
             stepCount++;
-
-            // ── Execute Current Node ───────────────────────────
             GraphNode node = nodes.get(currentNodeName);
+
             if (node == null) {
                 log.error("Node not found: {}", currentNodeName);
                 state.setErrorMessage("Unknown node: " + currentNodeName);
                 break;
             }
 
-            log.info("[Manual Info]→ Executing node: {} (step {})", currentNodeName, stepCount);
+            log.info("[Manual Info] → Executing node: {} (step {})", currentNodeName, stepCount);
             state.addExecutionStep(currentNodeName);
 
             try {
@@ -118,23 +102,25 @@ public class AgentGraph {
                 break;
             }
 
-            // ── Determine Next Node ────────────────────────────
+            String nextNode;
             if (conditionalEdges.containsKey(currentNodeName)) {
-                // Conditional routing
-                String nextNode = conditionalEdges.get(currentNodeName).route(state);
-                log.info("[Manual Info]  Conditional edge → {}", nextNode);
-                currentNodeName = nextNode;
-
+                nextNode = conditionalEdges.get(currentNodeName).route(state);
+                log.info("[Manual Info] Conditional edge → {}", nextNode);
             } else if (edges.containsKey(currentNodeName)) {
-                // Unconditional routing
-                currentNodeName = edges.get(currentNodeName);
-                log.info("[Manual Info]  Edge → {}", currentNodeName);
-
+                nextNode = edges.get(currentNodeName);
+                log.info("[Manual Info] Edge → {}", nextNode);
             } else {
-                // No outgoing edge = implicit END
-                log.info("[Manual Info]  No outgoing edge → END");
-                currentNodeName = END;
+                nextNode = END;
+                log.info("[Manual Info] No outgoing edge → END");
             }
+
+            if (!END.equals(nextNode) && !nodes.containsKey(nextNode)) {
+                log.error("Router returned an unregistered node: {}", nextNode);
+                state.setErrorMessage("Unregistered graph route: " + nextNode);
+                break;
+            }
+
+            currentNodeName = nextNode;
         }
 
         if (stepCount >= MAX_STEPS) {
@@ -142,10 +128,31 @@ public class AgentGraph {
             state.setErrorMessage("Max steps exceeded");
         }
 
-        log.info("[Manual Info]=== Graph Execution Complete [{}ms, {} steps] ===",
-                state.getElapsedMs(), stepCount);
-        log.info("[Manual Info]Execution path: {}", state.getExecutionPath());
+        log.info("[Manual Info] === Graph Execution Complete [{}ms, {} steps] ===", 
+                 state.getElapsedMs(), stepCount);
+        log.info("[Manual Info] Execution path: {}", state.getExecutionPath());
 
         return state;
+    }
+
+    private void validateRoutes() {
+        for (Map.Entry<String, String> edge : edges.entrySet()) {
+            validateRouteTarget(edge.getKey(), edge.getValue());
+        }
+
+        for (String from : conditionalEdges.keySet()) {
+            if (!nodes.containsKey(from)) {
+                throw new IllegalStateException("Conditional edge source not registered: " + from);
+            }
+        }
+    }
+
+    private void validateRouteTarget(String from, String to) {
+        if (to == null || END.equals(to)) {
+            return;
+        }
+        if (!nodes.containsKey(to)) {
+            throw new IllegalStateException("Edge from " + from + " points to unregistered node: " + to);
+        }
     }
 }

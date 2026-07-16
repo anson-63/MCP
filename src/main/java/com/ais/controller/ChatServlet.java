@@ -1,216 +1,133 @@
 package com.ais.controller;
 
-import com.ais.graph.AgentGraph;
-import com.ais.graph.GraphState;
-import com.ais.graph.VerificationGraphFactory;
+import com.ais.graph.*;
 import com.ais.config.AppConfig;
-import com.ais.service.OllamaService;
-import com.ais.service.QueryPlanner;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import javax.servlet.ServletException;
+import com.ais.service.*;
+import com.ais.security.AuthorizationContext;
+import com.fasterxml.jackson.databind.*;
+import com.fasterxml.jackson.databind.node.*;
+import org.slf4j.*;
+import org.owasp.html.*;
+import javax.servlet.*;
 import javax.servlet.annotation.WebServlet;
-import javax.servlet.http.HttpServlet;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
-import java.io.IOException;
-import java.io.PrintWriter;
-import java.util.List;
-import java.util.Properties;
+import javax.servlet.http.*;
+import java.io.*;
+import java.util.*;
 import java.util.stream.Collectors;
-import java.util.Map;
 
 @WebServlet("/api/chat")
 public class ChatServlet extends HttpServlet {
-
     private static final Logger log = LoggerFactory.getLogger(ChatServlet.class);
     private static final ObjectMapper mapper = new ObjectMapper();
-
-    private AgentGraph verificationGraph;
-    private OllamaService ollamaService;
+    
+    private AgentGraph primaryGraph;
+    private AgentGraph fallbackGraph;
     private QueryPlanner queryPlanner;
+    private OllamaService ollamaService;
+
+    private static final PolicyFactory ANSWER_HTML_POLICY = new HtmlPolicyBuilder()
+            .allowElements("p", "br", "strong", "em", "b", "i", "ul", "ol", "li", "div", "span", "table", "thead", "tbody", "tr", "th", "td", "a", "iframe")
+            .allowAttributes("class").globally()
+            .allowAttributes("href", "target", "rel").onElements("a")
+            .allowAttributes("src", "title", "width", "height", "loading").onElements("iframe")
+            .allowAttributes("colspan", "rowspan").onElements("th", "td")
+            .allowUrlProtocols("http", "https").toFactory();
 
     @Override
     public void init() throws ServletException {
         try {
             OllamaService.setContextPath(getServletContext().getContextPath());
-
-            // ── DELEGATE TO AppConfig (Single source of truth!) ──────────
-            boolean useTencent = AppConfig.useTencentCloud();
-            String ollamaUrl = AppConfig.ollamaBaseUrl();
-            String verifierModel = AppConfig.verifierModel();
-            // ─────────────────────────────────────────────────────────────
-
-            log.info("[Manual Info]Active Provider: {}", useTencent ? "Tencent Cloud" : "Ollama");
-            log.info("[Manual Info]Ollama URL: {}", ollamaUrl);
-            log.info("[Manual Info]Verifier model: {}", verifierModel);
-
             this.ollamaService = new OllamaService();
             this.queryPlanner = new QueryPlanner();
 
-            this.verificationGraph = VerificationGraphFactory.build(
-                    ollamaService,
-                    queryPlanner,
-                    ollamaUrl,
-                    verifierModel
-            );
+            // 1. Primary Graph (Uses Tencent if API key exists, else Ollama)
+            this.primaryGraph = VerificationGraphFactory.build(ollamaService, queryPlanner, 
+                    AppConfig.ollamaBaseUrl(), AppConfig.verifierModel());
 
-            log.info("[Manual Info]ChatServlet initialized. Graph ready.");
+            // 2. Fallback Graph (Always forced to local Ollama)
+            this.fallbackGraph = VerificationGraphFactory.build(ollamaService, queryPlanner, 
+                    AppConfig.ollamaBaseUrl(), AppConfig.ollamaModel());
 
+            log.info("ChatServlet initialized. Primary and Fallback graphs ready.");
         } catch (Exception e) {
-            throw new ServletException("Failed to initialize ChatServlet", e);
+            log.error("Init failed", e);
+            throw new ServletException("Init failed", e);
         }
     }
 
     @Override
-    protected void doPost(HttpServletRequest req, HttpServletResponse resp)
-            throws ServletException, IOException {
-
+    protected void doPost(HttpServletRequest req, HttpServletResponse resp) throws IOException {
         resp.setContentType("application/json; charset=UTF-8");
-        resp.setHeader("Access-Control-Allow-Origin", "*");
-        PrintWriter out = resp.getWriter();
+        String body = req.getReader().lines().collect(Collectors.joining());
+        JsonNode json = body.isEmpty() ? null : mapper.readTree(body);
+        String msg = (json != null && json.has("prompt")) ? json.get("prompt").asText() : req.getParameter("prompt");
 
-        // ── Read prompt from JSON body ─────────────────────────
-        // index.jsp sends: { "prompt": "..." }
-        String userMessage = null;
-        try {
-            String body = req.getReader()
-                    .lines()
-                    .collect(Collectors.joining());
-
-            if (body != null && !body.isEmpty()) {
-                JsonNode json = mapper.readTree(body);
-                if (json.has("prompt")) {
-                    userMessage = json.get("prompt").asText();
-                } else if (json.has("message")) {
-                    userMessage = json.get("message").asText();
-                }
-            }
-        } catch (Exception e) {
-            log.warn("Could not parse JSON body: {}", e.getMessage());
-        }
-
-        // ── Fallback to form parameters ────────────────────────
-        if (userMessage == null || userMessage.trim().isEmpty()) {
-            userMessage = req.getParameter("prompt");
-        }
-        if (userMessage == null || userMessage.trim().isEmpty()) {
-            userMessage = req.getParameter("message");
-        }
-
-        if (userMessage == null || userMessage.trim().isEmpty()) {
-            resp.setStatus(HttpServletResponse.SC_BAD_REQUEST);
-            out.write("{\"error\":\"Empty prompt\"}");
+        if (msg == null || msg.trim().isEmpty()) {
+            writeErrorResponse(resp, HttpServletResponse.SC_BAD_REQUEST, "Empty prompt");
             return;
         }
 
-        String sessionId = req.getSession().getId();
-        log.info("[Manual Info]Chat request: session={}, prompt={}",
-                sessionId, userMessage);
+        Object auth = req.getAttribute(AuthorizationContext.REQUEST_ATTRIBUTE);
+        if (!(auth instanceof AuthorizationContext)) {
+            writeErrorResponse(resp, HttpServletResponse.SC_UNAUTHORIZED, "Authentication required");
+            return;
+        }
+
+        GraphState state = new GraphState();
+        state.setUserQuery(msg.trim());
+        state.setSessionId(req.getSession().getId());
+        state.setAuthorizationContext((AuthorizationContext) auth);
 
         try {
-            GraphState initialState = new GraphState();
-            initialState.setUserQuery(userMessage.trim());
-            initialState.setSessionId(sessionId);
-            initialState.getContext().put("debug", false);
-
-            GraphState finalState = verificationGraph.invoke(initialState);
-
-            out.write(buildResponse(finalState));
-
+            resp.getWriter().write(buildResponse(primaryGraph.invoke(state)));
         } catch (Exception e) {
-            log.error("Chat error: {}", e.getMessage(), e);
-            resp.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
-            out.write("{\"error\":\"" + escapeJson(e.getMessage()) + "\"}");
+            if (!AppConfig.useTencentCloud()) {
+                log.error("Local AI execution failed", e);
+                writeErrorResponse(resp, HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "Internal AI error.");
+                return;
+            }
+            log.warn("Primary AI failed: {}. Falling back...", e.getMessage());
+            try {
+                GraphState f = fallbackGraph.invoke(state);
+                String r = f.getFinalResponse() == null ? "No response from local AI." : f.getFinalResponse();
+                f.setFinalResponse("[Fallback: Cloud AI unavailable, using local model]\n\n" + r);
+                resp.getWriter().write(buildResponse(f));
+            } catch (Exception fatal) {
+                log.error("Both AI pipelines failed", fatal);
+                writeErrorResponse(resp, HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "AI services unavailable.");
+            }
         }
     }
 
-    @Override
-    protected void doGet(HttpServletRequest req, HttpServletResponse resp)
-            throws ServletException, IOException {
-        resp.setContentType("application/json");
-        resp.getWriter().write("{\"status\":\"ChatServlet running\"}");
-    }
-
-    // ── Build response matching index.jsp expectations ────────────
-    // index.jsp reads: data.answer, data.toolCalls, data.elapsedMs, data.error
     private String buildResponse(GraphState state) throws IOException {
         ObjectNode root = mapper.createObjectNode();
-
-        String answer = state.getFinalResponse() != null
-                ? state.getFinalResponse()
-                : "I was unable to process your request.";
-        root.put("answer", answer);
-
+        String rawAnswer = state.getFinalResponse() != null ? state.getFinalResponse() : "Unable to process request.";
+        root.put("answer", ANSWER_HTML_POLICY.sanitize(rawAnswer));
         root.set("toolCalls", buildToolCallsJson(state));
         root.put("elapsedMs", state.getElapsedMs());
-        root.put("verified", state.isSuccess());
+        root.put("verified", state.getVerificationResult() == GraphState.VerificationResult.APPROVED);
         root.put("verificationResult", String.valueOf(state.getVerificationResult()));
-        root.put("retries", state.getRetryCount());
-
+        root.put("regenerations", state.getRegenerationCount());
+        root.put("repairAttempts", state.getRepairAttemptCount());
         return mapper.writeValueAsString(root);
     }
 
-    // index.jsp renderToolCall() expects: { name, args, result }
     private ArrayNode buildToolCallsJson(GraphState state) {
         ArrayNode arr = mapper.createArrayNode();
-
         List<Map<String, Object>> details = state.getToolCallDetails();
-        if (details != null && !details.isEmpty()) {
-            // NEW path: real per-call name/args/result, each independent
+        if (details != null) {
             for (Map<String, Object> entry : details) {
-                ObjectNode node = mapper.createObjectNode();
+                ObjectNode node = arr.addObject();
                 node.put("name", String.valueOf(entry.get("name")));
-                // args is a real Map -> let Jackson serialize it properly,
-                // instead of hand-building/hardcoding a JSON string
                 node.set("args", mapper.valueToTree(entry.get("args")));
-                Object result = entry.get("result");
-                node.put("result", result != null ? String.valueOf(result) : "");
-                arr.add(node);
-            }
-            return arr;
-        }
-
-        // OLD fallback path (kept only for safety during migration — should
-        // not normally trigger once PrimaryLlmNode's toolCallDetails patch
-        // is applied). Still better than before: uses Jackson instead of
-        // string concatenation, but args/result are still not per-call here.
-        List<String> toolNames = state.getToolCallsMade();
-        String toolOutput = state.getRawToolOutput();
-        if (toolNames != null) {
-            for (String name : toolNames) {
-                ObjectNode node = mapper.createObjectNode();
-                node.put("name", name);
-                node.set("args", mapper.createObjectNode());
-                node.put("result", toolOutput != null ? toolOutput : "");
-                arr.add(node);
+                node.put("result", String.valueOf(entry.getOrDefault("result", "")));
             }
         }
         return arr;
     }
 
-    private String toJsonString(String value) {
-        if (value == null) {
-            return "\"\"";
-        }
-        return "\"" + escapeJson(value) + "\"";
+    private void writeErrorResponse(HttpServletResponse resp, int status, String msg) throws IOException {
+        resp.setStatus(status);
+        resp.getWriter().write(mapper.writeValueAsString(mapper.createObjectNode().put("error", msg)));
     }
-
-    private String escapeJson(String s) {
-        if (s == null) {
-            return "";
-        }
-        return s.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\t", "\\t");
-    }
-
 }

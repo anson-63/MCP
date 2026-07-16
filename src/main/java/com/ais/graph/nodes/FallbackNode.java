@@ -47,7 +47,7 @@ public class FallbackNode implements GraphNode {
 
         if (state.getRetryCount() > 0) {
             html.append("<div style='color:#aaa;margin-top:6px;font-size:0.82rem;'>")
-                    .append("ℹ️ Attempted ")
+                    .append(" Attempted ")
                     .append(state.getRetryCount())
                     .append(state.getRetryCount() == 1 ? " retry" : " retries")
                     .append(" — none passed verification.")

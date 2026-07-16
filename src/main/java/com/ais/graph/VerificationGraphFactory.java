@@ -1,12 +1,10 @@
 package com.ais.graph;
 
-import com.ais.graph.nodes.FallbackNode;
-import com.ais.graph.nodes.FormatterNode;
-import com.ais.graph.nodes.PlannerNode;
-import com.ais.graph.nodes.PrimaryLlmNode;
-import com.ais.graph.nodes.VerifierNode;
+import com.ais.graph.nodes.*;
 import com.ais.service.OllamaService;
 import com.ais.service.QueryPlanner;
+import com.ais.service.MCPClientService;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -14,17 +12,14 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.Properties;
 
+/**
+ * Builds the verification graph and wires the targeted repair path.
+ */
 public class VerificationGraphFactory {
 
-    private static final Logger log
-            = LoggerFactory.getLogger(VerificationGraphFactory.class);
+    private static final Logger log = LoggerFactory.getLogger(VerificationGraphFactory.class);
 
-    /**
-     * Build the graph reading all configuration from application.properties. No
-     * hardcoded Ollama URL/model.
-     */
-    public static AgentGraph build(OllamaService ollamaService,
-            QueryPlanner queryPlanner) {
+    public static AgentGraph build(OllamaService ollamaService, QueryPlanner queryPlanner) {
         return build(
                 ollamaService,
                 queryPlanner,
@@ -33,10 +28,6 @@ public class VerificationGraphFactory {
         );
     }
 
-    /**
-     * Backward-compatible overload. URL/model parameters are only used as
-     * fallbacks if application.properties does not override them.
-     */
     public static AgentGraph build(
             OllamaService ollamaService,
             QueryPlanner queryPlanner,
@@ -46,7 +37,7 @@ public class VerificationGraphFactory {
         boolean verificationEnabled = getConfigBoolean("graph.verification.enabled", true);
         String effectiveModel = getConfig("verifier.model", verifierModel);
 
-        log.info("[Manual Info]Building verification graph. verificationEnabled={}, URL={}, model={}",
+        log.info("[Manual Info] Building verification graph. verificationEnabled={}, URL={}, model={}",
                 verificationEnabled, ollamaBaseUrl, effectiveModel);
 
         PlannerNode planner = new PlannerNode(queryPlanner);
@@ -63,91 +54,131 @@ public class VerificationGraphFactory {
                 .setEntryPoint("planner");
 
         if (verificationEnabled) {
+            MCPClientService mcpClient = ollamaService.getMcpClient();
             VerifierNode verifier = new VerifierNode(
-                    ollamaService, ollamaBaseUrl, effectiveModel);
+                    ollamaService,ollamaBaseUrl,
+                    effectiveModel,mcpClient
+            );
+            PatchNode patch = new PatchNode(mcpClient);
             graph.addNode("verifier", verifier)
-                    .addEdge("primary_llm", "verifier")
-                    .addConditionalEdge("verifier", new VerifierRouter());
+                 .addNode("patch", patch)
+                 .addEdge("primary_llm", "verifier")
+                 .addConditionalEdge("verifier",new VerifierRouter())
+                 .addConditionalEdge("patch",new PatchRouter());
         } else {
-            log.info("[Manual Info]Verification disabled (graph.verification=false); "
-                    + "routing primary_llm → formatter directly");
+            log.info("[Manual Info] Verification disabled; routing primary_llm → formatter directly");
             graph.addEdge("primary_llm", "formatter");
         }
 
         return graph.compile();
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // Config helpers — read from classpath application.properties
-    // ═══════════════════════════════════════════════════════════════════
     private static boolean getConfigBoolean(String key, boolean defaultValue) {
-        String v = getConfig(key, null);
-        if (v == null || v.trim().isEmpty()) {
+        String value = getConfig(key, null);
+        if (value == null || value.trim().isEmpty()) {
             return defaultValue;
         }
-        return Boolean.parseBoolean(v.trim());
+        return Boolean.parseBoolean(value.trim());
     }
 
     private static String getConfig(String key, String defaultValue) {
-        // 1. Try classpath application.properties
-        try (InputStream is = VerificationGraphFactory.class.getClassLoader()
+        try (InputStream input = VerificationGraphFactory.class
+                .getClassLoader()
                 .getResourceAsStream("application.properties")) {
-            if (is != null) {
-                Properties props = new Properties();
-                props.load(is);
-                String v = props.getProperty(key);
-                if (v != null && !v.trim().isEmpty()) {
-                    return v.trim();
+
+            if (input != null) {
+                Properties properties = new Properties();
+                properties.load(input);
+                String value = properties.getProperty(key);
+                if (value != null && !value.trim().isEmpty()) {
+                    return value.trim();
                 }
             }
         } catch (IOException e) {
             log.warn("Could not load classpath application.properties", e);
         }
 
-        // 2. Try -D system property
-        String sys = System.getProperty(key);
-        if (sys != null && !sys.trim().isEmpty()) {
-            return sys.trim();
+        String systemValue = System.getProperty(key);
+        if (systemValue != null && !systemValue.trim().isEmpty()) {
+            return systemValue.trim();
         }
 
-        // 3. Fallback
         return defaultValue;
     }
 
     /**
-     * Named static inner class instead of lambda. Avoids ClassNotFoundException
-     * for anonymous $1 class in Tomcat classloader.
+     * Routes verifier outcomes. The verifier increments the bounded retry
+     * counter before either a targeted patch or a full regeneration.
      */
     public static class VerifierRouter implements GraphEdge {
-
-        private static final Logger log
-                = LoggerFactory.getLogger(VerifierRouter.class);
+        private static final Logger log = LoggerFactory.getLogger(VerifierRouter.class);
 
         @Override
         public String route(GraphState state) {
             GraphState.VerificationResult result = state.getVerificationResult();
+
             if (result == GraphState.VerificationResult.APPROVED) {
-                log.info("[Manual Info][Router] APPROVED → formatter");
                 return "formatter";
             }
+
+            if (state.hasInfrastructureFailure()) {
+                log.warn(
+                    "[Router] Infrastructure failure → formatter: {}",
+                    state.getInfrastructureFailureReason()
+                );
+                return "formatter";
+            }
+
             if (result == GraphState.VerificationResult.RETRY) {
-                if (state.canRetry()) {
-                    state.incrementRetry();
-                    log.info("[Manual Info][Router] RETRY → primary_llm (attempt {}/{})",
-                            state.getRetryCount() + 1,
-                            GraphState.MAX_RETRIES);
+                VerifierFeedback feedback = state.getVerifierFeedback();
+                if (feedback != null
+                        && feedback.requestsToolRepair()
+                        && state.canAttemptRepair()) {
+                    state.incrementRepairAttempt();
+                    log.info(
+                        "[Router] RETRY → patch ({}/{})",
+                        state.getRepairAttemptCount(),
+                        GraphState.MAX_REPAIR_ATTEMPTS
+                    );
+                    return "patch";
+                }
+                if (state.canRegenerate()) {
+                    state.incrementRegeneration();
+                    log.info(
+                        "[Router] RETRY → primary_llm ({}/{})",
+                        state.getRegenerationCount(),
+                        GraphState.MAX_REGENERATIONS
+                    );
                     return "primary_llm";
                 }
-                log.warn("[Router] Max retries ({}) exhausted → formatter (best effort)",
-                        state.getRetryCount());
                 return "formatter";
             }
             if (result == GraphState.VerificationResult.REJECTED) {
-                log.warn("[Router] REJECTED → fallback. Reason={}",
-                        state.getVerificationReason());
                 return "fallback";
             }
-            log.warn("[Router] Unknown result {} → formatter", result);
+            return "formatter";
+        }
+    }
+
+    /**
+     * A successful patch is sent back through verification. A failed patch
+     * falls back to the ordinary bounded primary-LLM retry path.
+     */
+    public static class PatchRouter implements GraphEdge {
+        private static final Logger log = LoggerFactory.getLogger(PatchRouter.class);
+
+        @Override
+        public String route(GraphState state) {
+            if (state.isRepairSucceeded()) {
+                return "verifier";
+            }
+            if (state.hasInfrastructureFailure()) {
+                return "formatter";
+            }
+            if (state.canRegenerate()) {
+                state.incrementRegeneration();
+                return "primary_llm";
+            }
             return "formatter";
         }
     }

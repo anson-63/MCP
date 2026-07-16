@@ -2,19 +2,26 @@ package com.ais.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+
 import okhttp3.*;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
+
+import java.io.IOException;
+
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
+
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
+
 import com.ais.config.AppConfig;
 import com.ais.db.DatabaseManager;
 import com.ais.model.ExtractedKeywords;
@@ -24,6 +31,8 @@ import com.ais.service.IntentRole;
 import com.ais.service.Plan;
 import com.ais.service.PipelineExecutor;
 import com.ais.model.OpenAiRequest;
+import com.ais.security.AuthorizationContext;
+import com.ais.service.PlanOptimizer;
 
 public class OllamaService {
 
@@ -56,41 +65,93 @@ public class OllamaService {
     private final ObjectMapper mapper;
     private final MCPClientService mcpClient;
 
+    private final PlanOptimizer planOptimizer;
+
     private static volatile String contextPath = "";
 
     public static void setContextPath(String path) {
         contextPath = (path == null) ? "" : path;
     }
 
+    // ══════════════════════════════════════════════════════════════
+    // SECURITY CONSTANTS (ProjectReview P0/P1 fixes)
+    // ══════════════════════════════════════════════════════════════
+    /**
+     * Max agent loop iterations — prevents runaway tool-call storms.
+     */
+    private static final int AGENT_LOOP_MAX_ITERATIONS = 10;
+
+    /**
+     * Wall-clock timeout for the entire agent loop (ms).
+     */
+    private static final long AGENT_LOOP_TIMEOUT_MS = 30_000;
+
+    /**
+     * Dangerous SQL keywords that must NEVER appear in LLM-generated SQL.
+     * Defense-in-depth on top of the read-only DB user.
+     */
+    private static final Pattern SQL_DANGEROUS_PATTERN = Pattern.compile(
+            "(?i)\\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|EXEC|EXECUTE"
+            + "|XP_|SP_|SHUTDOWN|MERGE|BULK|OPENROWSET|OPENDATASOURCE"
+            + "|DBCC|GRANT|REVOKE|DENY)\\b"
+    );
+
+    /**
+     * Prompt injection patterns to strip from user input.
+     */
+    private static final Pattern[] PROMPT_INJECTION_PATTERNS = {
+        Pattern.compile("(?i)ignore\\s+(all\\s+)?(previous|prior|above)\\s+(instructions?|prompts?|rules?)"),
+        Pattern.compile("(?i)disregard\\s+(all\\s+)?(previous|prior|above)\\s+(instructions?|prompts?|rules?)"),
+        Pattern.compile("(?i)forget\\s+(all\\s+)?(previous|prior|above)\\s+(instructions?|prompts?|rules?)"),
+        Pattern.compile("(?i)you\\s+are\\s+now\\s+(a|an|in)\\s+"),
+        Pattern.compile("(?i)new\\s+instructions?:\\s*"),
+        Pattern.compile("(?i)system\\s*prompt\\s*:"),
+        Pattern.compile("(?i)reveal\\s+(your|the)\\s+(system|internal)\\s+prompt"),
+        Pattern.compile("(?i)return\\s+(the\\s+)?(full\\s+)?(system|internal)\\s+prompt"),
+        Pattern.compile("(?i)act\\s+as\\s+(if\\s+)?(a|an)\\s+"),
+        Pattern.compile("(?i)pretend\\s+(to\\s+be|you\\s+are)\\s+"),};
+
+    // ══════════════════════════════════════════════════════════════
+    // PROMPT INJECTION DEFENSE (ProjectReview P1 — Issue #9)
+    // ══════════════════════════════════════════════════════════════
+    /**
+     * Strips known prompt-injection patterns from user input. Also caps length
+     * to prevent token-exhaustion attacks.
+     */
+    private String sanitizeUserPrompt(String prompt) {
+        if (prompt == null || prompt.isEmpty()) {
+            return "";
+        }
+        String sanitized = prompt;
+        boolean injectionDetected = false;
+        for (Pattern p : PROMPT_INJECTION_PATTERNS) {
+            Matcher m = p.matcher(sanitized);
+            if (m.find()) {
+                injectionDetected = true;
+                sanitized = m.replaceAll("[filtered]").trim();
+            }
+        }
+        if (injectionDetected) {
+            log.warn("[Security] Prompt injection pattern detected and stripped");
+        }
+        if (sanitized.length() > 2000) {
+            sanitized = sanitized.substring(0, 2000);
+            log.warn("[Security] User prompt truncated to 2000 chars (was {})", prompt.length());
+        }
+        return sanitized;
+    }
+
     // ── System prompt for tool selection (first LLM call) ─────────
     //hardcode prompt instructions for tool selection
     private static final String SYSTEM_PROMPT
-            = "You are a location database assistant.\n\n"
-            + "Your job is to understand the user's natural language request and decide "
-            + "which tool or tools to call.\n\n"
-            + "RULES:\n"
-            + "1. search_by_name: Search by name or partial text. Accepts 'locName' and 'location'.\n"
-            + "2. search_declared_monument: List monuments. Accepts 'filter' and 'location'.\n"
-            + "3. search_historic_building: List graded buildings. Accepts 'grade' and 'location'.\n"
-            + "4. locations_by_dept: List by department. Accepts 'deptCd' and 'location'.\n"
-            + "5. locations_by_psm: List by PSM. Accepts 'psm' and 'location'.\n"
-            + "6. If the user asks about declared monuments, use search_declared_monument.\n"
-            + "7. If the user asks about historic buildings, use search_historic_building.\n"
-            + "8. If the user asks about report availability, use check_reports.\n\n"
-            + "MULTI-TOOL CHAINING:\n"
-            + "- You may call multiple tools in sequence.\n"
-            + "- If search_loc_cd_history returns CURRENT_LOC_CD, you may call hardcode_query next.\n"
-            + "- If a tool returns a list of LOC_CD values, you may use them in check_reports.\n"
-            + "- If a tool returns candidate locations, you may choose the best matching one and then fetch details.\n\n"
-            + "- When the user asks for a department in a specific area (e.g. 'LCSD in Sha Tin'), ALWAYS pass the area into the tool's 'location' parameter: locations_by_dept(deptCd='LCSD', location='Sha Tin').\n"
-            + "IMPORTANT:\n"
-            + "- Copy all location codes exactly.\n"
-            + "- When you have enough data, stop calling tools and answer briefly.\n"
-            + "- Do not invent database facts.\n"
-            + "If the user requests to exclude empty, missing, placeholder, or undefined fields"
-            + " (e.g., 'with address not null', 'real address', 'valid name', 'ignore empty departments')"
-            + ", set excludeUndefinedField to 'address', 'name', or 'department' in your JSON output.\n"
-            + "- /nothink";  // ← Qwen3 directive to disable thinking in prompt
+            = "You are a database assistant.\n\n"
+            + "Select tools only from the tools supplied in the API request.\n"
+            + "Use the tool descriptions and parameter schemas to choose tools.\n"
+            + "Copy location codes exactly.\n"
+            + "Use previous result codes only when the workflow requires it.\n"
+            + "Do not invent database facts.\n"
+            + "When enough data has been gathered, stop and answer briefly.\n"
+            + "/nothink";
     // ── System prompt for summary generation (second LLM call) ────
     //hardcode summary prompt text
     private static final String SUMMARY_PROMPT
@@ -222,9 +283,9 @@ public class OllamaService {
             + "Output: {\"intents\":[\"MONUMENT\"],\"locationCode\":null,\"locationName\":\"Sha Tin\",\"reportType\":null,\"department\":null,\"psm\":null,\"grade\":null,\"filter\":\"T\",\"modifier\":\"OLDEST\",\"rawKeywords\":[\"department\",\"oldest\",\"monument\",\"Sha Tin\"]}\n\n"
             + "Query: 'Which AFCD locations have both BSI and KAI reports?'\n"
             + "Output: {\"plan\":["
-            + "{\"type\":\"DEPARTMENT_LOCATIONS\",\"priority\":1,\"params\":{\"deptCd\":\"AFCD\"}},"
-            + "{\"type\":\"CHECK_REPORTS\",\"priority\":2,\"params\":{\"reportType\":\"BSI\"}},"
-            + "{\"type\":\"CHECK_REPORTS\",\"priority\":3,\"params\":{\"reportType\":\"KAI\"}}"
+            + "{\"type\":\"DEPARTMENT_LOCATIONS\",\"priority\":1,\"params\":{\"deptCd\":\"AFCD\"},\"relation\":\"independent\"},"
+            + "{\"type\":\"CHECK_REPORTS\",\"priority\":2,\"params\":{\"reportType\":\"BSI\"},\"relation\":\"use_previous_codes\"},"
+            + "{\"type\":\"CHECK_REPORTS\",\"priority\":3,\"params\":{\"reportType\":\"KAI\"},\"relation\":\"use_previous_codes\"}"
             + "]}\n\n"
             + "VALID PLAN STEP TYPES (use ONLY these exact strings for the \"type\" field):\n"
             + "- NAME_SEARCH: search locations by name (params: locName, location)\n"
@@ -389,13 +450,26 @@ public class OllamaService {
             + "/nothink";
 
     public OllamaService() {
+        this(new MCPClientService());
+    }
+
+    public OllamaService(MCPClientService mcpClient) {
+        if (mcpClient == null) {
+            throw new IllegalArgumentException(
+                    "mcpClient must not be null");
+        }
+
         this.httpClient = buildHttpClient();
         this.mapper = new ObjectMapper();
-        this.mcpClient = new MCPClientService();
+        this.mcpClient = mcpClient;
+        this.planner = new QueryPlanner(mcpClient);
+        this.planOptimizer = new PlanOptimizer(mcpClient);
+
         if (useTencent) {
-            log.info("[Manual Info]Using Tencent Cloud API — model: {}", tencentModel);
+            log.info("Using Tencent Cloud API — model: {}",
+                    tencentModel);
         } else {
-            log.info("[Manual Info]Using Ollama — model: {}", ollamaModel);
+            log.info("Using Ollama — model: {}", ollamaModel);
         }
     }
 
@@ -471,8 +545,11 @@ public class OllamaService {
     }
 
     public List<String> getLastResults(String sessionId) {
+        if (sessionId == null || sessionId.trim().isEmpty()) {
+            return new ArrayList<String>();
+        }
         List<String> codes = LAST_RESULTS.get(sessionId);
-        return codes != null ? codes : new ArrayList<String>();
+        return codes != null ? new ArrayList<String>(codes) : new ArrayList<String>();
     }
 
     // ── Clear memory when user changes topic ─────────────────────────
@@ -538,21 +615,23 @@ public class OllamaService {
     // Returns true if prompt needs LLM reasoning,
     // false if it can be handled by search_by_name directly.
     // ══════════════════════════════════════════════════════════════
-    // Signals that indicate a complex/reasoning query
-    
-    // Signals that indicate a simple name lookup
-    private static final Pattern SIMPLE_NAME_PATTERN = Pattern.compile(
-            "(?i)^(info of|tell me about|search for|find|show me|what is|get|lookup|"
-            + "details of|details for|about|show|info)\\s+[a-zA-Z\\s]+$"
-    );
-    
-    private final QueryPlanner planner = new QueryPlanner();
+    private final QueryPlanner planner;
 
     // ══════════════════════════════════════════════════════════════
     // MAIN ENTRY POINT
     // ══════════════════════════════════════════════════════════════
-    public AgentResult invoke(String userPrompt, String sessionId) throws IOException {
-    	AgentResult result = new AgentResult();
+    public AgentResult invoke(
+            String userPrompt, String sessionId,
+            AuthorizationContext authorizationContext
+    ) throws IOException {
+        boolean sqlAttempted = false;
+        boolean sqlTimedOut = false;
+        boolean fastPathAttempted = false;
+        AgentResult result = new AgentResult();
+
+        // ── Prompt injection defense (P1 — Issue #9) ─────────────
+        userPrompt = sanitizeUserPrompt(userPrompt);
+
         result.setPrompt(userPrompt);
         long t0 = System.currentTimeMillis();
 
@@ -563,7 +642,6 @@ public class OllamaService {
             userPrompt = resolvedPrompt;
             result.setPrompt(userPrompt);
         }
-
 
         // ── Phase 1: Keyword extraction ───────────────────────────────
         log.info("[Manual Info]Extracting keywords...");
@@ -584,11 +662,15 @@ public class OllamaService {
                 step.params.putIfAbsent("excludeUndefinedField", keywords.getExcludeUndefinedField());
             }
         }
+        Plan optimizedPlan = planOptimizer.optimize(plan);
         // ── Phase 3: Fast-path ────────────────────────────────────────
-        if (!plan.needsLlm && !plan.steps.isEmpty()) {
-            String answer = executePlan(plan, result, sessionId);
+        if (!optimizedPlan.needsLlm && !optimizedPlan.steps.isEmpty()) {
+            fastPathAttempted = true;
+            String answer = executePlan(optimizedPlan, result, sessionId);
             if (!isEmptyResult(answer)) {
-                result.setAnswer(answer);
+                // ── Natural language summary (P2 — Issue #5) ─────
+                String summary = generateNaturalLanguageSummary(answer, userPrompt);
+                result.setAnswer(summary + answer);
                 log.info("[Manual Info]Total: {}ms (fast-path)", System.currentTimeMillis() - t0);
                 return result;
             }
@@ -599,40 +681,41 @@ public class OllamaService {
         // Trigger SQL generation when:
         // 1. The query is unknown / compound / explicitly SQL_QUERY
         // 2. The fast-path tool result was empty (e.g. 50-row limit hid the match)
-        boolean useSqlFallback = keywords != null && (keywords.hasIntent("UNKNOWN")
-                || keywords.hasIntent("SQL_QUERY")
-                || keywords.isCompound() // multi-intent → SQL
-                );
-        if (!useSqlFallback && isEmptyResult(result.getAnswer())) {
-            log.info("[Manual Info]Empty tool result → SQL generation");
+        boolean useSqlFallback = keywords != null && keywords.hasIntent("SQL_QUERY");
+        if (!useSqlFallback && fastPathAttempted && isEmptyResult(result.getAnswer())) {
             useSqlFallback = true;
         }
-        if (useSqlFallback) {
-            log.info("[Manual Info]{} → generating SQL directly",
-                    keywords.isCompound() ? "compound " + keywords.getIntents()
-                    : keywords.primaryIntent());
+
+        if (useSqlFallback && !sqlAttempted) {
+            sqlAttempted = true;
             try {
-                String sqlResult = generateAndExecuteSql(userPrompt, keywords);
-                if (!isUselessSqlResult(sqlResult)) {
+                String sqlResult = generateAndExecuteSql(userPrompt, keywords, authorizationContext);
+                if (isTimeoutResult(sqlResult)) {
+                    sqlTimedOut = true;
+                    log.warn("Generated SQL timed out; this strategy will not run again in this request");
+                } else if (!isUselessSqlResult(sqlResult)) {
                     String html = formatSqlResultWithDetails(sqlResult, keywords, result);
-                    result.setAnswer(html);
+                    String summary = generateNaturalLanguageSummary(html, userPrompt);
+                    result.setAnswer(summary + html);
                     log.info("[Manual Info]Total: {}ms (SQL gen)", System.currentTimeMillis() - t0);
                     return result;
                 }
-                log.warn(" SQL gen empty → falling back to agent loop");
             } catch (Exception e) {
-                log.error("SQL gen failed: {}", e.getMessage());
+                log.error("SQL generation failed: {}", e.getMessage());
             }
         }
         // ── Phase 5: Agent loop (last resort) ─────────────────────────
         log.info("[Manual Info]Entering agent loop: {}", plan.reason);
         AgentResult agentResult = runAgentLoop(userPrompt, keywords, result, sessionId);
         // ── Phase 6: Post-agent SQL fallback ──────────────────────────
-        if (isEmptyResult(agentResult.getAnswer())) {
-            log.info("[Manual Info]Agent empty → SQL fallback");
+        if (!sqlAttempted && !sqlTimedOut && isEmptyResult(agentResult.getAnswer())) {
+            sqlAttempted = true;
+            log.info("[Manual Info]Agent empty → one SQL fallback");
             try {
-                String sqlResult = generateAndExecuteSql(userPrompt, keywords);
-                if (!isUselessSqlResult(sqlResult)) {
+                String sqlResult = generateAndExecuteSql(userPrompt, keywords, authorizationContext);
+                if (isTimeoutResult(sqlResult)) {
+                    sqlTimedOut = true;
+                } else if (!isUselessSqlResult(sqlResult)) {
                     String html = formatSqlResultWithDetails(sqlResult, keywords, agentResult);
                     agentResult.setAnswer(html);
                 }
@@ -642,6 +725,13 @@ public class OllamaService {
         }
         log.info("[Manual Info]Total: {}ms", System.currentTimeMillis() - t0);
         return agentResult;
+    }
+
+    public AgentResult invoke(String userPrompt,
+            String sessionId)
+            throws IOException {
+
+        return invoke(userPrompt, sessionId, null);
     }
 
     // ── Check if SQL result itself is useless ────────────────────────
@@ -886,10 +976,10 @@ public class OllamaService {
                 = new ArrayList<Map<String, Object>>();
         Map<String, Object> sys = new LinkedHashMap<String, Object>();
         sys.put("role", "system");
-        sys.put("content", systemPrompt);          // ✅ param, not missing var
+        sys.put("content", systemPrompt);          // param, not missing var
         fullMessages.add(sys);
-        fullMessages.addAll(messages);             // ✅ List<Map> — no type error
-        String requestBody = buildAgentRequest(fullMessages, tools); // ✅ tools is param
+        fullMessages.addAll(messages);             // List<Map> — no type error
+        String requestBody = buildAgentRequest(fullMessages, tools); // tools is param
         log.debug("Ollama agent request: {}", requestBody);
         Request httpReq = new Request.Builder()
                 .url(OLLAMA_URL)
@@ -913,7 +1003,7 @@ public class OllamaService {
             if (rawContent.contains("<think>")) {
                 log.warn(" LLM thinking tags detected — stripping.");
             }
-            return root.path("message");           // ✅ returns JsonNode, not String
+            return root.path("message");           // returns JsonNode, not String
         } finally {
             if (httpResp != null) {
                 httpResp.close();
@@ -1030,6 +1120,9 @@ public class OllamaService {
             if (node.has("psm") && node.has("results")) {
                 return formatLocationsByPsm(node);
             }
+            if (node.has("checks") && node.path("checks").isObject()) {
+                return formatMultipleReportChecks(node);
+            }
             // ── Bulk report check ─────────────────────────────────────
             if (node.has("withReport") && node.has("withoutReport")) {
                 return formatBulkReportCheck(node);
@@ -1087,7 +1180,7 @@ public class OllamaService {
         StringBuilder html = new StringBuilder();
         if (!found) {
             html.append("<div class='answer-box'>")
-                    .append("<p class='answer-summary'>ℹ️ ")
+                    .append("<p class='answer-summary'> ")
                     .append(escapeHtml(summary))
                     .append("</p>")
                     .append("</div>");
@@ -1115,7 +1208,7 @@ public class OllamaService {
     }
 
     // ── Format bulk report check (the new pretty output) ─────────────
-        // ── Format bulk report check as a sortable/filterable TABLE ─────────────
+    // ── Format bulk report check as a sortable/filterable TABLE ─────────────
     private String formatBulkReportCheck(JsonNode node) {
         String reportType = node.path("reportType").asText("");
         String reportName = node.path("reportName").asText("Report");
@@ -1286,7 +1379,7 @@ public class OllamaService {
             html.append("<div style='margin:8px 0;'>");
             if (isMonument) {
                 html.append("<span class='report-type-badge' style='background:#c0392b;color:white;'>")
-                        .append("🏛️ Declared Monument</span> ");
+                        .append("Declared Monument</span> ");
             }
             if (!grade.isEmpty()) {
                 html.append("<span class='report-type-badge' style='background:#8e44ad;color:white;'>")
@@ -1796,12 +1889,12 @@ public class OllamaService {
                 return result;
             }
         }
-        
+
         /**
          * Returns the output of a previously recorded tool call with the same
          * tool name and equivalent arguments (case-insensitive, trimmed String
-         * values, key order ignored), or null if no such call has been made
-         * yet in this request. Used to skip re-executing a tool the pipeline
+         * values, key order ignored), or null if no such call has been made yet
+         * in this request. Used to skip re-executing a tool the pipeline
          * already called earlier in the SAME invoke() — whether that earlier
          * call came from the fast path (executePlan), the agent loop
          * (runAgentLoop), or anywhere else that shares this AgentResult.
@@ -1816,7 +1909,7 @@ public class OllamaService {
             }
             return null;
         }
-        
+
         /**
          * Builds a normalized, order-independent, case-insensitive string key
          * from an args map, WITHOUT requiring Jackson (AgentResult is a static
@@ -1895,8 +1988,8 @@ public class OllamaService {
                 .append("</h3>");
         int showing = results.size();
         html.append("Found <strong>").append(count).append("</strong> location(s)")
-            .append(showing < count ? " (showing first " + showing + ")" : "")
-            .append(".");
+                .append(showing < count ? " (showing first " + showing + ")" : "")
+                .append(".");
         if (count == 0) {
             html.append("<p>No locations found under this PSM.</p>");
             return html.toString();
@@ -1932,12 +2025,12 @@ public class OllamaService {
         int count = node.path("count").asInt(0);
         JsonNode results = node.path("results");
         StringBuilder html = new StringBuilder();
-        html.append("<h3 class='data-title'>🏢 Locations for Department: ")
+        html.append("<h3 class='data-title'>Locations for Department: ")
                 .append(escapeHtml(deptCd)).append("</h3>");
         int showing = results.size();
         html.append("Found <strong>").append(count).append("</strong> location(s)")
-            .append(showing < count ? " (showing first " + showing + ")" : "")
-            .append(".");
+                .append(showing < count ? " (showing first " + showing + ")" : "")
+                .append(".");
         if (count == 0) {
             html.append("<p>No locations found for this department.</p>");
             return html.toString();
@@ -1978,8 +2071,8 @@ public class OllamaService {
         html.append("<h3 class='data-title'>Declared Monuments</h3>");
         int showing = results.size();
         html.append("Found <strong>").append(count).append("</strong> location(s)")
-            .append(showing < count ? " (showing first " + showing + ")" : "")
-            .append(".");
+                .append(showing < count ? " (showing first " + showing + ")" : "")
+                .append(".");
         if (count == 0) {
             html.append("<p>No matching locations found.</p>");
             return html.toString();
@@ -2006,7 +2099,7 @@ public class OllamaService {
             String address = item.path("ADDRESS").asText("").trim();
             String monFlag = item.path("DECLR_MONUMT").asText("");
             String grade = item.path("GRD_HIST_BLDG").asText("N/A");
-            String monDisplay = "T".equals(monFlag) ? "✅ Yes"
+            String monDisplay = "T".equals(monFlag) ? "Yes"
                     : "F".equals(monFlag) ? "[Error] No" : monFlag;
             String gradeDisplay;
             if ("N/A".equals(grade) || grade.isEmpty()) {
@@ -2045,12 +2138,12 @@ public class OllamaService {
                 : "0".equals(grade) || "NONE".equals(grade)
                 ? "Non-Graded Buildings"
                 : "Grade " + grade + " Historic Buildings";
-        html.append("<h3 class='data-title'>🏰 ").append(escapeHtml(gradeLabel))
+        html.append("<h3 class='data-title'>").append(escapeHtml(gradeLabel))
                 .append("</h3>");
         int showing = results.size();
         html.append("Found <strong>").append(count).append("</strong> location(s)")
-            .append(showing < count ? " (showing first " + showing + ")" : "")
-            .append(".");
+                .append(showing < count ? " (showing first " + showing + ")" : "")
+                .append(".");
         if (count == 0) {
             html.append("<p>No matching locations found.</p>");
             return html.toString();
@@ -2092,7 +2185,7 @@ public class OllamaService {
         int count = node.path("count").asInt(0);
         JsonNode results = node.path("results");
         StringBuilder html = new StringBuilder();
-        html.append("<h3 class='data-title'>📜 Location Code Change History</h3>");
+        html.append("<h3 class='data-title'>Location Code Change History</h3>");
         // Show what was searched
         if (node.has("formerLocCd") && node.has("currentLocCd")
                 && node.path("formerLocCd").asText("").equals(node.path("currentLocCd").asText(""))) {
@@ -2153,24 +2246,80 @@ public class OllamaService {
         return html.toString();
     }
 
-    // ── Extract CURRENT_LOC_CD values from search_loc_cd_history result ──
-    private List<String> extractCurrentCodesFromHistory(String historyJson) {
-        LinkedHashSet<String> codes = new LinkedHashSet<String>();
-        try {
-            JsonNode node = mapper.readTree(historyJson);
-            JsonNode results = node.path("results");
-            if (results.isArray()) {
-                for (JsonNode item : results) {
-                    String currentCd = item.path("CURRENT_LOC_CD").asText("").trim();
-                    if (!currentCd.isEmpty()) {
-                        codes.add(currentCd.toUpperCase());
-                    }
-                }
-            }
-        } catch (Exception e) {
-            log.error("Failed to extract current codes from history result: {}", e.getMessage());
+    // ══════════════════════════════════════════════════════════════
+    // NATURAL LANGUAGE SUMMARY (ProjectReview P2 — Issue #5)
+    // ══════════════════════════════════════════════════════════════
+    /**
+     * Generate a one-sentence natural language summary of the result. Uses
+     * template-based approach (zero latency).
+     */
+    private String generateNaturalLanguageSummary(String htmlResult, String userPrompt) {
+        String templateSummary = buildTemplateSummary(htmlResult);
+        if (templateSummary != null && !templateSummary.isEmpty()) {
+            return "<p class='answer-summary'><i class='fa-solid fa-comment-dots'></i> "
+                    + escapeHtml(templateSummary) + "</p>";
         }
-        return new ArrayList<String>(codes);
+        return "";
+    }
+
+    /**
+     * Deterministic template-based summary — no LLM call, zero latency.
+     */
+    private String buildTemplateSummary(String html) {
+        if (html == null || html.isEmpty()) {
+            return null;
+        }
+        String text = html.replaceAll("<[^>]+>", " ").replaceAll("\\s+", " ").trim();
+
+        java.util.regex.Matcher countMatcher = java.util.regex.Pattern
+                .compile("Found (\\d+) location\\(s\\)")
+                .matcher(text);
+        if (countMatcher.find()) {
+            int count = Integer.parseInt(countMatcher.group(1));
+            if (count == 0) {
+                return "No matching locations were found for your query.";
+            }
+            if (count == 1) {
+                return "Here are the details for the matching location:";
+            }
+            return "I found " + count + " matching locations for your query:";
+        }
+
+        java.util.regex.Matcher reportMatcher = java.util.regex.Pattern
+                .compile("(\\d+) of (\\d+) locations have")
+                .matcher(text);
+        if (reportMatcher.find()) {
+            return reportMatcher.group(1) + " out of " + reportMatcher.group(2)
+                    + " locations have the requested report.";
+        }
+
+        if (text.contains("Property Service Managers")) {
+            java.util.regex.Matcher psmMatcher = java.util.regex.Pattern
+                    .compile("(\\d+) distinct PSMs")
+                    .matcher(text);
+            if (psmMatcher.find()) {
+                return "There are " + psmMatcher.group(1) + " Property Service Managers on record.";
+            }
+        }
+
+        if (text.contains("Location Code Change History")) {
+            java.util.regex.Matcher histMatcher = java.util.regex.Pattern
+                    .compile("Found (\\d+) change record")
+                    .matcher(text);
+            if (histMatcher.find()) {
+                return "I found " + histMatcher.group(1) + " code change record(s) in the history.";
+            }
+        }
+
+        if (text.contains("Declared Monument")) {
+            return "Here are the declared monuments matching your query:";
+        }
+
+        if (text.contains("Historic Building") || text.contains("Historic Grade")) {
+            return "Here are the historic buildings matching your query:";
+        }
+
+        return null;
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -2227,80 +2376,10 @@ public class OllamaService {
     }
 
     // ── Build a minimal tool list for the agent loop ─────────────────
-    private List<Map<String, Object>> getRelevantTools(
-            String userPrompt,
-            ExtractedKeywords kw) {
-        String p = userPrompt.toUpperCase();
-        List<Map<String, Object>> all = mcpClient.listTools();
-        List<Map<String, Object>> filtered = new ArrayList<Map<String, Object>>();
-        for (Map<String, Object> tool : all) {
-            @SuppressWarnings("unchecked")
-            Map<String, Object> fn = (Map<String, Object>) tool.get("function");
-            String name = fn.get("name").toString();
-            boolean include
-                    = "hardcode_query".equals(name)
-                    || "search_by_name".equals(name)
-                    || "search_loc_cd_history".equals(name);
-            // ── Boost from raw prompt ─────────────────────────────────
-            if (p.contains("PSM")) {
-                include |= "list_psms".equals(name) || "locations_by_psm".equals(name);
-            }
-            if (p.contains("BSI") || p.contains("CSR") || p.contains("KAI")
-                    || p.contains("EMMS") || p.contains("DSSR") || p.contains("REPORT")) {
-                include |= "check_reports".equals(name);
-            }
-            if (p.contains("HISTORIC") || p.contains("GRADE")) {
-                include |= "search_historic_building".equals(name);
-            }
-            if (p.contains("MONUMENT")) {
-                include |= "search_declared_monument".equals(name);
-            }
-            if (p.contains("DEPT") || p.contains("DEPARTMENT")) {
-                include |= "locations_by_dept".equals(name);
-            }
-            // ── Boost from LLM keywords (more accurate) ───────────────
-            if (kw != null) {
-                // ── Compound or unknown → include all tools ───────────────
-                if (kw.isCompound() || kw.hasIntent("UNKNOWN")) {
-                    include = true;
-                } else {
-                    String primary = kw.primaryIntent();
-                    switch (primary) {
-                        case "MONUMENT":
-                            include |= "search_declared_monument".equals(name);
-                            break;
-                        case "HISTORIC":
-                            include |= "search_historic_building".equals(name);
-                            break;
-                        case "DEPARTMENT":
-                            include |= "locations_by_dept".equals(name);
-                            break;
-                        case "PSM":
-                            include |= "list_psms".equals(name)
-                                    || "locations_by_psm".equals(name);
-                            break;
-                        case "REPORT":
-                            include |= "check_reports".equals(name);
-                            break;
-                        case "CODE_HISTORY":
-                            include |= "search_loc_cd_history".equals(name);
-                            break;
-                        default:
-                            break;
-                    }
-                }
-                if (include) {
-                    Map<String, Object> clean = new LinkedHashMap<String, Object>();
-                    clean.put("type", tool.get("type"));
-                    clean.put("function", tool.get("function"));
-                    filtered.add(clean);
-                }
-            }
-        }
-        return filtered;
+    private List<Map<String, Object>> getRelevantTools(String userPrompt, ExtractedKeywords keywords) {
+        return mcpClient.listTools();
     }
 
-    // ── Keep old single-param signature for backward compatibility ──
     private List<Map<String, Object>> getRelevantTools(String userPrompt) {
         return getRelevantTools(userPrompt, null);
     }
@@ -2310,217 +2389,141 @@ public class OllamaService {
     // Runs all steps in order. Steps can depend on previous results
     // via codesSource markers.
     // ══════════════════════════════════════════════════════════════
-    private String executePlan(Plan plan,
-            AgentResult result,
-            String sessionId) throws IOException {
-        StringBuilder html = new StringBuilder();
-        List<String> lastCodes = new ArrayList<String>();
-        String lastToolResult = null;
+    private String executePlan(Plan plan, AgentResult result, String sessionId) throws IOException {
+        if (plan == null || plan.steps == null || plan.steps.isEmpty()) {
+            return "<p>No executable plan was produced.</p>";
+        }
 
-        // Determine which step is the "answer step" — the one whose result is
-        // returned to the user. Modifiers (FIRST/OLDEST/etc.) should only be
-        // applied to this step. The answer step is the last step that is NOT
-        // a "use_previous_codes" consumer. If all steps consume previous codes,
-        // the first step is the answer.
-        int answerStepIndex = -1;
-        for (int i = plan.steps.size() - 1; i >= 0; i--) {
-            Intent intent = plan.steps.get(i);
-            String rel = intent.params.get("relation");
-            if (!"use_previous_codes".equals(rel)) {
-                // Validate this step has a tool mapping
-                String toolName = resolveToolName(intent.type);
-                if (toolName != null) {
-                    answerStepIndex = i;
-                    break;
-                } else {
-                    log.warn(" Answer step candidate {} ({}) has no tool mapping — skipping for modifier target",
-                            i, intent.type);
-                }
-            }
-        }
-        if (answerStepIndex < 0 && !plan.steps.isEmpty()) {
-            // Fallback: find ANY step with a tool mapping
+        StringBuilder html = new StringBuilder();
+        List<String> lastCodes = new ArrayList<>();
+        String lastToolResult = null;
+        int answerStepIndex = findAnswerStepIndex(plan);
+
+        if (answerStepIndex < 0) {
             for (int i = plan.steps.size() - 1; i >= 0; i--) {
-                String toolName = resolveToolName(plan.steps.get(i).type);
-                if (toolName != null) {
+                Intent intent = plan.steps.get(i);
+                if (resolveToolName(intent) != null) {
                     answerStepIndex = i;
                     break;
                 }
             }
         }
+
         if (answerStepIndex >= 0) {
-            log.info("[Manual Info]Answer step (modifier target): {} {}",
-                    answerStepIndex, plan.steps.get(answerStepIndex).type);
+            log.info("[Manual Info] Answer step: {} {}", answerStepIndex, plan.steps.get(answerStepIndex).type);
         }
 
         for (int i = 0; i < plan.steps.size(); i++) {
             Intent intent = plan.steps.get(i);
-            log.info("▶ Executing intent [{}]: {}", i, intent);
-
-            // ── Skip redundant LOCATION_CODE step ──────────────────
-            // If this step just re-fetches the exact same location the
-            // previous step's modifier (FIRST/OLDEST/NEWEST) already
-            // resolved via hardcode_query, there is nothing new to do —
-            // executing it again would duplicate the DB call and, worse,
-            // duplicate the rendered detail card (map included) in the
-            // final HTML.
-            if (Intent.LOCATION_CODE.equals(intent.type)
-                    && "use_previous_codes".equals(intent.params.get("relation"))
-                    && lastToolResult != null
-                    && lastCodes.size() == 1) {
-                try {
-                    JsonNode prevNode = mapper.readTree(lastToolResult);
-                    if (prevNode.has("general")) {
-                        String prevCode = prevNode.path("general").path("LOC_CD").asText("");
-                        if (!prevCode.isEmpty() && prevCode.equalsIgnoreCase(lastCodes.get(0))) {
-                            log.info("⏭ Skipping redundant LOCATION_CODE step [{}] — "
-                                    + "previous step already resolved full details for {}",
-                                    i, prevCode);
-                            continue; // previous step's rendered HTML already shows this location
-                        }
-                    }
-                } catch (Exception ignored) {
-                    // Malformed/unexpected lastToolResult — fall through and
-                    // execute the step normally rather than risk skipping
-                    // something that was actually needed.
-                }
+            if (intent == null) {
+                continue;
             }
 
-            // ══════════════════════════════════════════════════════════
-            // STEP 1: Build args
-            // ══════════════════════════════════════════════════════════
+            log.info("[Manual Info] Executing plan step [{}]: {}", i, intent);
+
+            /*
+	         * Avoid rendering the same full detail card twice when a modifier
+	         * already fetched the detail result.
+             */
+            if (isRedundantDetailStep(intent, lastToolResult, lastCodes)) {
+                log.info("[Manual Info] Skipping redundant detail step [{}]", i);
+                continue;
+            }
+
+            String relation = getRelation(intent);
+
+            if (i == 0 && ("filter_previous".equals(relation) || "enrich_previous".equals(relation))) {
+                log.warn("Invalid relation '{}' on first plan step; skipping step {}", relation, i);
+                html.append("<p class='answer-summary'>The query plan contained an invalid first-step relation.</p>");
+                continue;
+            }
+
             Map<String, Object> args = buildArgs(intent, lastToolResult, lastCodes, sessionId);
+
             if (args == null) {
-                html.append("<p class='answer-summary'>"
-                        + " No location codes available to check reports for.</p>");
+                log.warn("[Manual Info] Skipping step [{}] because required arguments are unavailable", i);
+                html.append("<p class='answer-summary'>This step could not be executed because required input data was unavailable.</p>");
                 continue;
             }
-            // ══════════════════════════════════════════════════════════
-            // STEP 2: Resolve tool name
-            // ══════════════════════════════════════════════════════════
-            String toolName = resolveToolName(intent.type);
-            if (toolName == null) {
-                // If this skipped step had a modifier, transfer it to the answer step
-                String orphanModifier = intent.params.get("modifier");
-                if (orphanModifier != null && !orphanModifier.isEmpty() && answerStepIndex >= 0) {
+
+            String toolName = resolveToolName(intent);
+
+            if (toolName == null || toolName.trim().isEmpty()) {
+                String orphanModifier = intent.params == null ? null : intent.params.get("modifier");
+                if (orphanModifier != null && !orphanModifier.trim().isEmpty() && answerStepIndex >= 0) {
                     Intent answerIntent = plan.steps.get(answerStepIndex);
-                    if (answerIntent.params.get("modifier") == null) {
+                    if (answerIntent.params != null && answerIntent.params.get("modifier") == null) {
                         answerIntent.params.put("modifier", orphanModifier);
-                        log.info("[Manual Info]Transferred orphan modifier '{}' from skipped step {} ({}) to answer step {} ({})",
-                                orphanModifier, i, intent.type, answerStepIndex, answerIntent.type);
                     }
                 }
-                log.warn(" No tool mapped for intent: {}", intent.type);
+                log.warn("[Manual Info] No tool mapped for intent {}", intent.type);
                 continue;
             }
-            // ══════════════════════════════════════════════════════════
-            // STEP 3: Call tool
-            // ══════════════════════════════════════════════════════════
-            log.info("[Manual Info]Tool: {} args: {}", toolName, args);
+
+            log.info("[Manual Info] Tool: {} args: {}", toolName, args);
+
             String previousToolResult = lastToolResult;
-            String r;
-            
-            String cachedR = result.findEquivalentCallResult(toolName, args);
-            if (cachedR != null) {
-                log.info("[Manual Info] executePlan: skipping duplicate tool call [{} {}] — "
-                        + "identical/equivalent call already made earlier in this request",
-                        toolName, args);
-                r = cachedR;
+            String cachedResult = result.findEquivalentCallResult(toolName, args);
+            String toolResult;
+
+            if (cachedResult != null) {
+                log.info("[Manual Info] Skipping duplicate tool call [{} {}]", toolName, args);
+                toolResult = cachedResult;
             } else {
-	            // Handle CHECK_REPORTS with ALL or comma-separated types
-	            if ("check_reports".equals(toolName)) {
-	                String reportType = intent.params.get("reportType");
-	                @SuppressWarnings("unchecked")
-	                List<String> codesToCheck = (List<String>) args.get("locCds");
-	                if (reportType != null && ("ALL".equalsIgnoreCase(reportType) || reportType.contains(","))) {
-	                    log.info("[Manual Info] Expanding check_reports: {} → individual types", reportType);
-	                    r = callCheckReports(reportType, codesToCheck, result);
-	                } else {
-	                    r = mcpClient.callTool(toolName, args);
-	                    result.addToolCall(toolName, args, r);
-	                }
-	            } else {
-	                r = mcpClient.callTool(toolName, args);
-	                result.addToolCall(toolName, args, r);
-	            }
+                toolResult = mcpClient.callTool(toolName, args);
+                result.addToolCall(toolName, args, toolResult);
             }
-            lastToolResult = r;
-            // ══════════════════════════════════════════════════════════
-            // STEP 4: Apply relation to previous step result
-            // ══════════════════════════════════════════════════════════
-            String relation = intent.params.get("relation");
-            if (relation == null) {
-                if ("previous".equals(intent.params.get("crossFilterWith"))) {
-                    relation = "filter_previous";
-                } else if ("true".equals(intent.params.get("enrich"))) {
-                    relation = "enrich_previous";
-                } else {
-                    relation = "independent";
-                }
-            }
+
+            String finalResult = toolResult;
+
             if ("filter_previous".equals(relation) && previousToolResult != null) {
-                log.info("[Manual Info]Filtering previous results with '{}' data", intent.type);
-                r = crossFilter(previousToolResult, r);
+                finalResult = crossFilter(previousToolResult, finalResult);
             } else if ("enrich_previous".equals(relation) && previousToolResult != null) {
-                log.info("[Manual Info]Enriching previous results with '{}' data", intent.type);
-                if (Intent.HISTORIC_BUILDING.equals(intent.type)) {
-                    String gradeFilter = intent.params.get("grade"); // e.g., "1", "ALL", "GRADED"
-                    r = enrichWithHistoricGrade(previousToolResult, r, gradeFilter);
-                } else {
-                    r = enrichWithPrevious(previousToolResult, r);
-                }
+                finalResult = enrichWithPrevious(previousToolResult, finalResult);
             }
-            // ══════════════════════════════════════════════════════════
-            // STEP 5: Post-call modifiers (OLDEST / NEWEST / FIRST)
-            // Only apply modifiers to the answer step. This prevents a modifier
-            // from being applied to an intermediate independent step (e.g.
-            // PSM_LOCATIONS) and collapsing the result set before a later
-            // filter_previous/enrich_previous step can run correctly.
-            // ══════════════════════════════════════════════════════════
+
             if (i == answerStepIndex) {
-                r = applyModifier(intent, r, result);
-            } else {
-                log.info("[Manual Info]Skipping modifier on intermediate step {} ({}) — not the answer step",
-                        i, intent.type);
+                finalResult = applyModifier(intent, finalResult, result);
             }
-            // ══════════════════════════════════════════════════════════
-            // STEP 6: Update state
-            // ══════════════════════════════════════════════════════════
-            // ══════════════════════════════════════════════════════════
-            lastCodes = extractCodesFromResult(r);
-            // Also extract CURRENT_LOC_CD from history results
-            if (lastCodes.isEmpty() && Intent.CODE_HISTORY.equals(intent.type)) {
-                lastCodes = extractCurrentCodesFromHistory(r);
-                log.info("[Manual Info]Extracted {} current code(s) from history result", lastCodes.size());
-            }
-            if (!lastCodes.isEmpty()) {
-                LAST_RESULTS.put(sessionId, lastCodes);
-                log.info("[Manual Info]Saved {} codes to session memory", lastCodes.size());
-            }
-            // ── STEP 6: Render HTML ───────────────────────────────────────────────
-            boolean isEnrichStep = "enrich_previous".equals(relation) || "true".equals(intent.params.get("enrich"));
-            if (isEnrichStep) {
-                // Replace previous HTML with enriched result
+
+            lastToolResult = finalResult;
+            lastCodes = extractCodesFromResult(finalResult);
+
+            lastCodes = extractCodesFromResult(finalResult);
+
+            if (isFilteringRelation(relation) && lastCodes.isEmpty()) {
+                log.info("Plan intersection is empty after step {}; stopping", i);
                 html.setLength(0);
-                html.append(formatAsHtml(r));
-            } else {
-                html.append(formatAsHtml(r));
+                html.append(formatAsHtml(finalResult));
+                break;
             }
-            // ══════════════════════════════════════════════════════════
-            // STEP 7: Post-step chain actions
-            // ══════════════════════════════════════════════════════════
-            html.append(runPostStepChains(intent, r, lastCodes, result, sessionId));
+
+            if (!lastCodes.isEmpty() && sessionId != null && !sessionId.trim().isEmpty()) {
+                LAST_RESULTS.put(sessionId, new ArrayList<>(lastCodes));
+                log.info("[Manual Info] Saved {} location codes to session {}", lastCodes.size(), sessionId);
+            }
+
+            boolean isEnrichStep = "enrich_previous".equals(relation);
+
+            if (isEnrichStep) {
+                html.setLength(0);
+            }
+
+            html.append(formatAsHtml(finalResult));
         }
 
-        // ══════════════════════════════════════════════════════════
-        // GENERALIZED INTERSECTION SUMMARY
-        // Shows which codes survived all filter_previous steps,
-        // regardless of tool type (reports, historic, monuments, etc.)
-        // ══════════════════════════════════════════════════════════
+        /*
+	     * Optional generic intersection summary.
+         */
         int chainedFilters = 0;
         StringBuilder filterDescriptions = new StringBuilder();
+
         for (Intent step : plan.steps) {
-            if ("filter_previous".equals(step.params.get("relation"))) {
+            if (step == null || step.params == null) {
+                continue;
+            }
+
+            if ("filter_previous".equals(getRelation(step))) {
                 chainedFilters++;
                 if (filterDescriptions.length() > 0) {
                     filterDescriptions.append(" ∩ ");
@@ -2530,28 +2533,16 @@ public class OllamaService {
         }
 
         if (chainedFilters >= 2 && !lastCodes.isEmpty()) {
-            log.info("[Manual Info] Intersection: {} codes survived {} filter(s): {}",
-                    lastCodes.size(), chainedFilters, filterDescriptions);
+            html.append("<div style='margin-top:16px;border:2px solid #27ae60;border-radius:8px;padding:16px;'>");
+            html.append("<h3 style='color:#27ae60;'>Matched locations</h3>");
+            html.append("<p class='answer-summary'><strong>" + lastCodes.size() + "</strong> location(s) matched all filters: <strong>" + escapeHtml(filterDescriptions.toString()) + "</strong></p>");
+            html.append("<table class='data-table'><tr><th>#</th><th>Code</th></tr>");
 
-            StringBuilder s = new StringBuilder();
-            s.append("<div style='margin-top:16px;border:2px solid #27ae60;")
-                    .append("border-radius:8px;padding:16px;'>");
-            s.append("<h3 style='color:#27ae60;'>✅ Matched locations</h3>");
-            s.append("<p class='answer-summary'><strong>")
-                    .append(lastCodes.size())
-                    .append("</strong> location(s) matched all filters: <strong>")
-                    .append(escapeHtml(filterDescriptions.toString()))
-                    .append("</strong></p>");
-            s.append("<table class='data-table'>")
-                    .append("<tr><th>#</th><th>Code</th></tr>");
-            int idx = 1;
+            int index = 1;
             for (String code : lastCodes) {
-                s.append("<tr><td>").append(idx++).append("</td>")
-                        .append("<td><code>").append(escapeHtml(code))
-                        .append("</code></td></tr>");
+                html.append("<tr><td>" + (index++) + "</td><td><code>" + escapeHtml(code) + "</code></td></tr>");
             }
-            s.append("</table></div>");
-            html.append(s);
+            html.append("</table></div>");
         }
 
         return html.length() > 0 ? html.toString() : "<p>No results found.</p>";
@@ -2593,275 +2584,304 @@ public class OllamaService {
     }
 
     // ── Format SQL result as HTML; if user wants details, fetch full info ─
-    private String formatSqlResultWithDetails(String sqlResult,
-            ExtractedKeywords keywords,
+    private String formatSqlResultWithDetails(String sqlResult, ExtractedKeywords keywords,
             AgentResult result) throws IOException {
         String firstCode = extractFirstLocCdFromSqlResult(sqlResult);
-        if (keywords != null && keywords.isShowDetails() && firstCode != null) {
-            log.info("[Manual Info]SQL result + showDetails=true → fetching full details for {}", firstCode);
-            Map<String, Object> detailArgs = map("locCd", firstCode);
-            String detailResult = mcpClient.callTool("hardcode_query", detailArgs);
-            result.addToolCall("hardcode_query", detailArgs, detailResult);
-            return "<p class='answer-summary'>"
-                    + "<i class='fa-solid fa-lightbulb'></i> Answered using a generated database query and full details:"
-                    + "</p>" + formatAsHtml(detailResult);
+        int resultCount = readSqlResultCount(sqlResult);
+
+        boolean singleSelection = resultCount == 1 || hasSingleSelectionModifier(keywords);
+
+        boolean wantsDetails = keywords != null && keywords.isShowDetails()
+                && singleSelection && firstCode != null && !firstCode.trim().isEmpty();
+
+        if (wantsDetails) {
+            String detailTool = resolveDetailToolName(firstCode);
+            if (detailTool != null) {
+                Map<String, Object> detailArgs = map("locCd", firstCode.trim().toUpperCase(Locale.ROOT));
+                String detailResult = mcpClient.callTool(detailTool, detailArgs);
+                result.addToolCall(detailTool, detailArgs, detailResult);
+                return "<p class='answer-summary'>Answered using a generated database query and full details:</p>"
+                        + formatAsHtml(detailResult);
+            }
         }
-        return "<p class='answer-summary'>"
-                + "<i class='fa-solid fa-lightbulb'></i> Answered using a generated database query:"
-                + "</p>" + formatAsHtml(sqlResult);
+
+        return "<p class='answer-summary'>Answered using a generated database query:</p>"
+                + formatAsHtml(sqlResult);
+    }
+
+    private int readSqlResultCount(String sqlResult) {
+        try {
+            JsonNode node = mapper.readTree(sqlResult);
+            return node.path("count").asInt(node.path("results").size());
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private boolean hasSingleSelectionModifier(ExtractedKeywords keywords) {
+        if (keywords == null || keywords.getModifier() == null) {
+            return false;
+        }
+        String modifier = keywords.getModifier().trim().toUpperCase(Locale.ROOT);
+        return "FIRST".equals(modifier) || "OLDEST".equals(modifier)
+                || "NEWEST".equals(modifier) || "LATEST".equals(modifier);
     }
 
     // ── Extract all LOC_CD values from a tool result ─────────────────
     private List<String> extractCodesFromResult(String toolResult) {
-        List<String> codes = new ArrayList<String>();
         if (toolResult == null || toolResult.trim().isEmpty()) {
-            return codes;
+            return new ArrayList<>();
         }
+        LinkedHashSet<String> codes = new LinkedHashSet<>();
         try {
             JsonNode node = mapper.readTree(toolResult);
-            LinkedHashSet<String> seen = new LinkedHashSet<String>();
-            // 1. Array-style results (most tool responses)
             JsonNode results = node.path("results");
-            if (results.isArray()) {
-                for (JsonNode item : results) {
-                    String cd = item.path("LOC_CD").asText("").trim();
-                    if (!cd.isEmpty()) {
-                        seen.add(cd.toUpperCase());
-                    }
-                }
-            }
-            // 2. Single-location detail object: { "general": { "LOC_CD": "..." } }
-            if (seen.isEmpty()) {
-                JsonNode general = node.path("general");
-                String cd = general.path("LOC_CD").asText("").trim();
-                if (!cd.isEmpty()) {
-                    seen.add(cd.toUpperCase());
-                }
-            }
-            // 3. Direct top-level LOC_CD (e.g., from structured find responses)
-            if (seen.isEmpty()) {
-                String cd = node.path("LOC_CD").asText("").trim();
-                if (!cd.isEmpty()) {
-                    seen.add(cd.toUpperCase());
-                }
-            }
-            // 4. check_reports format: extract from withReport array
-            if (seen.isEmpty()) {
-                JsonNode withReport = node.path("withReport");
-                if (withReport.isArray()) {
-                    for (JsonNode item : withReport) {
-                        String cd = item.path("LOC_CD").asText("").trim();
-                        if (!cd.isEmpty()) {
-                            seen.add(cd.toUpperCase());
-                        }
-                    }
-                    if (!seen.isEmpty()) {
-                        log.info("[Manual Info]Extracted {} codes from withReport array", seen.size());
-                    }
-                }
-            }
-            codes.addAll(seen);
+            collectLocationCodes(results.isArray() ? results : node, codes);
         } catch (Exception e) {
-            log.error("extractCodesFromResult error: {}", e.getMessage());
+            log.warn("Failed to extract location codes: {}", e.getMessage());
         }
-        return codes;
+        return new ArrayList<>(codes);
+    }
+
+    private void collectLocationCodes(JsonNode node, Set<String> codes) {
+        if (node == null || node.isNull()) {
+            return;
+        }
+
+        if (node.isArray()) {
+            for (JsonNode child : node) {
+                collectLocationCodes(child, codes);
+            }
+            return;
+        }
+
+        if (!node.isObject()) {
+            return;
+        }
+
+        Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
+        while (fields.hasNext()) {
+            Map.Entry<String, JsonNode> entry = fields.next();
+            String fieldName = entry.getKey();
+            JsonNode value = entry.getValue();
+
+            boolean isLocationCodeField = "LOC_CD".equalsIgnoreCase(fieldName) || "CURRENT_LOC_CD".equalsIgnoreCase(fieldName);
+            if (isLocationCodeField && value != null && value.isValueNode()) {
+                String code = value.asText("").trim().toUpperCase();
+                if (!code.isEmpty()) {
+                    codes.add(code);
+                }
+            }
+            collectLocationCodes(value, codes);
+        }
     }
 
     // ── Cross-filter: keep only results that appear in reference set ──
-    private String crossFilter(String firstResult,
-            String secondResult) {
+    private String crossFilter(String firstResult, String secondResult) {
+        if (firstResult == null || secondResult == null) {
+            return secondResult;
+        }
+
         try {
             JsonNode firstNode = mapper.readTree(firstResult);
             JsonNode secondNode = mapper.readTree(secondResult);
-            JsonNode firstArr = firstNode.path("results");
-            JsonNode secondArr = secondNode.path("results");
-            if (!secondArr.isArray() && secondNode.has("withReport")) {
-                JsonNode withReport = secondNode.path("withReport");
-                Set<String> reportCodes = new LinkedHashSet<String>();
-                if (withReport.isArray()) {
-                    for (JsonNode item : withReport) {
-                        String cd = item.path("LOC_CD").asText("").trim().toUpperCase();
-                        if (!cd.isEmpty()) {
-                            reportCodes.add(cd);
-                        }
-                    }
-                }
-                log.info("[Manual Info]crossFilter: check_reports has {} codes with report", reportCodes.size());
+            JsonNode firstRows = firstNode.path("results");
+            JsonNode secondRows = secondNode.path("results");
 
-                if (firstArr.isArray()) {
-                    List<JsonNode> filtered = new ArrayList<JsonNode>();
-                    for (JsonNode item : firstArr) {
-                        String cd = item.path("LOC_CD").asText("").trim().toUpperCase();
-                        if (reportCodes.contains(cd)) {
-                            filtered.add(item);
-                        }
-                    }
-                    Map<String, Object> response = new LinkedHashMap<String, Object>();
-                    response.put("count", filtered.size());
-                    response.put("results", filtered);
-                    response.put("reportType", secondNode.path("reportType").asText(""));
-                    return mapper.writeValueAsString(response);
+            Set<String> firstCodes = new LinkedHashSet<>(extractCodesFromResult(firstResult));
+            Set<String> secondCodes = new LinkedHashSet<>(extractCodesFromResult(secondResult));
+
+            if (firstCodes.isEmpty() || secondCodes.isEmpty()) {
+                Map<String, Object> emptyResponse = new LinkedHashMap<>();
+                emptyResponse.put("count", 0);
+                emptyResponse.put("results", new ArrayList<JsonNode>());
+                copyResultMetadata(secondNode, emptyResponse);
+                return mapper.writeValueAsString(emptyResponse);
+            }
+            /*
+	         * If the second tool has rows, preserve the second tool's
+	         * attributes and filter those rows using the first result.
+             */
+            boolean preserveSecondRows = secondRows.isArray();
+            JsonNode sourceRows = preserveSecondRows ? secondRows : firstRows;
+            Set<String> allowedCodes = preserveSecondRows ? firstCodes : secondCodes;
+
+            if (!sourceRows.isArray()) {
+                Map<String, Object> emptyResponse = new LinkedHashMap<>();
+                emptyResponse.put("count", 0);
+                emptyResponse.put("results", new ArrayList<JsonNode>());
+                copyResultMetadata(secondNode, emptyResponse);
+                return mapper.writeValueAsString(emptyResponse);
+            }
+
+            List<JsonNode> filteredRows = new ArrayList<>();
+            for (JsonNode row : sourceRows) {
+                String rowCode = getRowLocationCode(row);
+                if (rowCode != null && allowedCodes.contains(rowCode.toUpperCase())) {
+                    filteredRows.add(row);
                 }
-                return secondResult;
             }
-            if (!firstArr.isArray() || !secondArr.isArray()) {
-                return secondResult;
-            }
-            // Build LOC_CD set from first result
-            Set<String> firstCodes = new LinkedHashSet<String>();
-            for (JsonNode item : firstArr) {
-                String cd = item.path("LOC_CD").asText("").trim().toUpperCase();
-                if (!cd.isEmpty()) {
-                    firstCodes.add(cd);
-                }
-            }
-            List<JsonNode> filtered = new ArrayList<JsonNode>();
-            for (JsonNode item : secondArr) {
-                String cd = item.path("LOC_CD").asText("").trim().toUpperCase();
-                if (firstCodes.contains(cd)) {
-                    filtered.add(item);
-                }
-            }
-            Map<String, Object> response = new LinkedHashMap<String, Object>();
-            response.put("count", filtered.size());
-            response.put("results", filtered);
-            // preserve useful flags from second result
-            if (secondNode.has("grade")) {
-                response.put("grade", secondNode.path("grade").asText(""));
-            }
-            if (firstNode.has("filter")) {
-                response.put("filter", firstNode.path("filter").asText(""));
-            }
+
+            Map<String, Object> response = new LinkedHashMap<>();
+            response.put("count", filteredRows.size());
+            response.put("results", filteredRows);
+
+            copyResultMetadata(firstNode, response);
+            copyResultMetadata(secondNode, response);
+
             return mapper.writeValueAsString(response);
+
         } catch (Exception e) {
             log.error("crossFilter error: {}", e.getMessage());
-            return secondResult;
+            return emptyFilteredResult(secondResult);
+        }
+    }
+
+    private String getRowLocationCode(JsonNode row) {
+        if (row == null || !row.isObject()) {
+            return null;
+        }
+
+        String code = row.path("LOC_CD").asText("").trim();
+        if (code.isEmpty()) {
+            code = row.path("CURRENT_LOC_CD").asText("").trim();
+        }
+        return code.isEmpty() ? null : code;
+    }
+
+    private void copyResultMetadata(JsonNode source, Map<String, Object> target) {
+        if (source == null || !source.isObject()) {
+            return;
+        }
+
+        Iterator<Map.Entry<String, JsonNode>> fields = source.fields();
+        while (fields.hasNext()) {
+            Map.Entry<String, JsonNode> entry = fields.next();
+            String key = entry.getKey();
+
+            if ("count".equals(key) || "results".equals(key)) {
+                continue;
+            }
+            target.put(key, entry.getValue());
         }
     }
     // ══════════════════════════════════════════════════════════════
     // AGENT LOOP  (unchanged — callOllama signature still matches)
     // ══════════════════════════════════════════════════════════════
 
-    private AgentResult runAgentLoop(
-            String userPrompt,
-            ExtractedKeywords keywords,
-            AgentResult result,
-            String sessionId) throws IOException {
-        List<Map<String, Object>> messages
-                = buildInitialMessages(userPrompt, keywords);
-        List<Map<String, Object>> tools
-                = getRelevantTools(userPrompt, keywords);
+    private AgentResult runAgentLoop(String userPrompt, ExtractedKeywords keywords, AgentResult result, String sessionId) throws IOException {
+        userPrompt = sanitizeUserPrompt(userPrompt);
+        List<Map<String, Object>> messages = buildInitialMessages(userPrompt, keywords);
+        List<Map<String, Object>> tools = getRelevantTools(userPrompt, keywords);
         StringBuilder htmlOutput = new StringBuilder();
-        List<String> reasoningSteps = new ArrayList<String>();
-        
-        int maxIterations = 5;
+        int maxIterations = AGENT_LOOP_MAX_ITERATIONS;
+
         if (keywords != null && keywords.hasIntent("UNKNOWN")) {
             maxIterations = 2;
-            log.info("[Manual Info] UNKNOWN intent — limiting agent loop to {} iterations",
-                    maxIterations);
+            log.info("[Manual Info] UNKNOWN intent; limiting loop to {} iterations", maxIterations);
         }
+
+        long loopStartTime = System.currentTimeMillis();
+
         for (int iteration = 0; iteration < maxIterations; iteration++) {
-            log.info("[Manual Info]Agent loop iteration {}", iteration + 1);
-            //callOllama(List<Map>, List<Map>, String) → JsonNode
-            JsonNode llmResponse = callOllama(messages, tools, SYSTEM_PROMPT);
-            JsonNode toolCalls = llmResponse.path("tool_calls");
-            String content = stripThinkingTags(
-                    llmResponse.path("content").asText("").trim());
-            if (toolCalls.isMissingNode() || toolCalls.isEmpty()) {
-                log.info("[Manual Info]Agent loop done after {} iteration(s)", iteration + 1);
+            long elapsed = System.currentTimeMillis() - loopStartTime;
+
+            if (elapsed > AGENT_LOOP_TIMEOUT_MS) {
+                log.warn("[Security] Agent loop timeout after {} ms", elapsed);
+                if (htmlOutput.length() == 0) {
+                    htmlOutput.append("<p>The query took too long. Please try a simpler question.</p>");
+                }
                 break;
             }
-            if (!content.isEmpty()) {
-                reasoningSteps.add(content);
+
+            log.info("[Manual Info] Agent loop iteration {}", iteration + 1);
+            JsonNode llmResponse = callOllama(messages, tools, SYSTEM_PROMPT);
+            JsonNode toolCalls = llmResponse.path("tool_calls");
+            String content = stripThinkingTags(llmResponse.path("content").asText("").trim());
+
+            if (toolCalls.isMissingNode() || toolCalls.isEmpty()) {
+                log.info("[Manual Info] Agent loop completed after {} iteration(s)", iteration + 1);
+                break;
             }
-            Map<String, Object> assistantMsg = new LinkedHashMap<String, Object>();
-            assistantMsg.put("role", "assistant");
+
+            Map<String, Object> assistantMessage = new LinkedHashMap<>();
+            assistantMessage.put("role", "assistant");
+
             if (!content.isEmpty()) {
-                assistantMsg.put("content", content);
+                assistantMessage.put("content", content);
             }
-            assistantMsg.put("tool_calls", mapper.convertValue(toolCalls,
-                    mapper.getTypeFactory().constructCollectionType(
-                            List.class, Object.class)));
-            messages.add(assistantMsg);
+
+            assistantMessage.put("tool_calls", mapper.convertValue(toolCalls, mapper.getTypeFactory().constructCollectionType(List.class, Object.class)));
+            messages.add(assistantMessage);
+
             for (JsonNode toolCall : toolCalls) {
-                String toolName = toolCall.path("function").path("name").asText();
-                JsonNode argsNode = toolCall.path("function").path("arguments");
+                String toolName = toolCall.path("function").path("name").asText("");
+
+                if (toolName.trim().isEmpty()) {
+                    log.warn("[Manual Info] LLM returned an empty tool name");
+                    continue;
+                }
+
+                JsonNode argumentsNode = toolCall.path("function").path("arguments");
                 Map<String, Object> args;
-                // Tencent Cloud sometimes returns tool-call arguments as a JSON string
-                // instead of an object. Parse the string when that happens.
-                if (argsNode.isTextual()) {
-                    String argsText = argsNode.asText();
-                    if (argsText == null || argsText.trim().isEmpty()) {
-                        args = new LinkedHashMap<String, Object>();
+
+                if (argumentsNode.isTextual()) {
+                    String argumentsText = argumentsNode.asText("");
+                    if (argumentsText.trim().isEmpty()) {
+                        args = new LinkedHashMap<>();
                     } else {
-                        args = mapper.readValue(argsText,
-                                mapper.getTypeFactory().constructMapType(
-                                        Map.class, String.class, Object.class));
+                        args = mapper.readValue(argumentsText, mapper.getTypeFactory().constructMapType(Map.class, String.class, Object.class));
                     }
+                } else if (argumentsNode.isObject()) {
+                    args = mapper.convertValue(argumentsNode, mapper.getTypeFactory().constructMapType(Map.class, String.class, Object.class));
                 } else {
-                    args = mapper.convertValue(argsNode,
-                            mapper.getTypeFactory().constructMapType(
-                                    Map.class, String.class, Object.class));
+                    args = new LinkedHashMap<>();
                 }
+
                 if (args == null) {
-                    args = new LinkedHashMap<String, Object>();
+                    args = new LinkedHashMap<>();
                 }
-                log.info("[Manual Info]LLM SELECTED TOOL  : [{}]", toolName);
-                log.info("[Manual Info]LLM GENERATED ARGS : {}", args);
 
-                String cachedAgentR = result.findEquivalentCallResult(toolName, args);
+                log.info("[Manual Info] LLM selected tool: {}", toolName);
+                log.info("[Manual Info] LLM generated args: {}", args);
+
+                String cachedResult = result.findEquivalentCallResult(toolName, args);
                 String toolResult;
-                if (cachedAgentR != null) {
-                    log.info("[Manual Info] Agent loop: skipping duplicate tool call [{} {}] — "
-                            + "identical/equivalent call already made earlier in this request "
-                            + "(possibly by the fast path before the agent loop started)",
-                            toolName, args);
-                    toolResult = cachedAgentR;
-                } else {
-                	if ("check_reports".equals(toolName)) {
-                        String reportType = args.get("reportType") != null ? args.get("reportType").toString() : null;
-                        @SuppressWarnings("unchecked")
-                        List<String> locCds = (List<String>) args.get("locCds");
-                        if (reportType != null && ("ALL".equalsIgnoreCase(reportType) || reportType.contains(","))) {
-                            log.info("[Manual Info] Agent loop: expanding check_reports: {} → individual types", reportType);
-                            toolResult = callCheckReports(reportType, locCds, result);
-                            // NOTE: callCheckReports() already calls result.addToolCall() internally
-                            // for each expanded sub-call (see callCheckReports() method) — do NOT
-                            // add another record here, or the expanded calls get double-recorded too.
-                        } else {
-                            toolResult = mcpClient.callTool(toolName, args);
-                            // no addToolCall here — recorded once below after postProcess
-                        }
-                    } else {
-                        toolResult = mcpClient.callTool(toolName, args);
-                        // no addToolCall here — recorded once below after postProcess
-                    }
-                	
-                	toolResult = postProcess(toolName, args, toolResult, userPrompt, sessionId, result);
 
-                    // Single record per real tool invocation. Skip if callCheckReports() path
-                    // already recorded its own sub-calls (reportType ALL/comma-separated).
-                    boolean alreadyRecordedByExpansion = "check_reports".equals(toolName)
-                            && args.get("reportType") != null
-                            && (args.get("reportType").toString().equalsIgnoreCase("ALL")
-                                || args.get("reportType").toString().contains(","));
-                    if (!alreadyRecordedByExpansion) {
-                        result.addToolCall(toolName, args, toolResult);
-                    }
+                if (cachedResult != null) {
+                    log.info("[Manual Info] Skipping duplicate agent tool call [{} {}]", toolName, args);
+                    toolResult = cachedResult;
+                } else {
+                    toolResult = mcpClient.callTool(toolName, args);
+                    toolResult = postProcess(toolName, args, toolResult, userPrompt, sessionId, result);
+                    result.addToolCall(toolName, args, toolResult);
                 }
+
                 htmlOutput.append(formatAsHtml(toolResult));
-                Map<String, Object> toolMsg = new LinkedHashMap<String, Object>();
-                toolMsg.put("role", "tool");
-                toolMsg.put("content", truncateToolResult(toolResult));
-                messages.add(toolMsg);
+
+                Map<String, Object> toolMessage = new LinkedHashMap<>();
+                toolMessage.put("role", "tool");
+                String toolCallId = toolCall.path("id").asText("");
+
+                if (!toolCallId.isEmpty()) {
+                    toolMessage.put("tool_call_id", toolCallId);
+                }
+                toolMessage.put("content", truncateToolResult(toolResult));
+                messages.add(toolMessage);
             }
         }
+
         if (htmlOutput.length() == 0) {
             htmlOutput.append("<p>No results found.</p>");
         }
-        result.setAnswer(htmlOutput.toString());
+
+        String agentHtml = htmlOutput.toString();
+        String summary = generateNaturalLanguageSummary(agentHtml, userPrompt);
+        result.setAnswer(summary + agentHtml);
+
         return result;
     }
+
     // ══════════════════════════════════════════════════════════════
     // HELPER: Truncate tool result before feeding back to LLM
     // The LLM only needs a SUMMARY of results, not all 50 rows.
@@ -2966,184 +2986,18 @@ public class OllamaService {
     // HELPER: Enhance zero-result search by trying keyword splits
     // e.g., "playground in Lo Wu" returns 0 → retry with "Lo Wu"
     // ══════════════════════════════════════════════════════════════
-    private String enhanceSearchResult(String toolName,
-            Map<String, Object> args,
-            String toolResult,
-            String sessionId) {
-        try {
-            JsonNode node = mapper.readTree(toolResult);
-            int count = node.path("count").asInt(0);
-            // Only enhance if zero results and this was a name search
-            if (count > 0 || !"search_by_name".equals(toolName)) {
-                return toolResult;
-            }
-            String locName = args.get("locName") != null
-                    ? args.get("locName").toString() : "";
-            if (locName.isEmpty()) {
-                return toolResult;
-            }
-            // Strip common prepositions and try the last meaningful word(s)
-            String cleaned = locName
-                    .replaceAll("(?i)\\b(in|at|near|of|for|the|a|an|which|"
-                            + "has|have|with|that|whose|is|are)\\b", " ")
-                    .replaceAll("\\s+", " ").trim();
-            String[] words = cleaned.split("\\s+");
-            // Try progressively shorter suffixes (last 2 words, last 1 word)
-            for (int len = Math.min(words.length - 1, 2); len >= 1; len--) {
-                String[] slice = Arrays.copyOfRange(
-                        words, words.length - len, words.length);
-                String candidate = String.join(" ", slice).trim();
-                if (candidate.isEmpty()
-                        || candidate.equalsIgnoreCase(locName)) {
-                    continue;
-                }
-                log.info("[Manual Info]Zero results for '{}', retrying with '{}'",
-                        locName, candidate);
-                Map<String, Object> retryArgs = new LinkedHashMap<String, Object>();
-                retryArgs.put("locName", candidate);
-                String retryResult = mcpClient.callTool("search_by_name", retryArgs);
-                JsonNode retryNode = mapper.readTree(retryResult);
-                if (retryNode.path("count").asInt(0) > 0) {
-                    log.info("[Manual Info]✅ Found {} results with '{}'",
-                            retryNode.path("count").asInt(0), candidate);
-                    return retryResult;
-                }
-            }
-        } catch (Exception e) {
-            log.error("enhanceSearchResult error: {}", e.getMessage());
-        }
-        return toolResult;
-    }
-
     // ══════════════════════════════════════════════════════════════
     // POST-PROCESSOR: Java-side processing after each tool call
     // Filters, enriches, or chains results before feeding to LLM
     // ══════════════════════════════════════════════════════════════
-    private String postProcess(String toolName,
-            Map<String, Object> args,
-            String toolResult,
-            String userPrompt,
-            String sessionId,
-            AgentResult result) {
-        String promptUpper = userPrompt.toUpperCase();
-        try {
-            // ── 1. search_declared_monument or search_historic_building ──
-            // If user mentioned a place name, filter results to that place
-            if ("search_declared_monument".equals(toolName)
-                    || "search_historic_building".equals(toolName)) {
-                String locationFilter = extractLocationFromPrompt(userPrompt);
-                if (locationFilter != null) {
-                    String filtered = filterResultsByLocation(toolResult, locationFilter);
-                    log.info("[Manual Info] Post-filtered {} results to match '{}'",
-                            toolName, locationFilter);
-                    // If "oldest" is mentioned, find oldest and fetch details
-                    if (promptUpper.contains("OLDEST")
-                            || promptUpper.contains("EARLIEST")) {
-                        List<String> codes = extractCodesFromResult(filtered);
-                        if (!codes.isEmpty()) {
-                            log.info("[Manual Info] Finding oldest among {} filtered results", codes.size());
-                            return findOldestWithDetails(codes, result);
-                        }
-                    }
-                    return filtered;
-                }
-                // No location filter but "oldest" is mentioned
-                if (promptUpper.contains("OLDEST") || promptUpper.contains("EARLIEST")) {
-                    List<String> codes = extractCodesFromResult(toolResult);
-                    if (!codes.isEmpty()) {
-                        log.info("[Manual Info] Finding oldest among {} results (no location filter)",
-                                codes.size());
-                        return findOldestWithDetails(codes, result);
-                    }
-                }
-            }
-            // ── 2. search_by_name ─────────────────────────────────────
-            if ("search_by_name".equals(toolName)) {
-                toolResult = enhanceSearchResult(toolName, args, toolResult, sessionId);
-                rememberLastResults(sessionId, toolResult);
-            }
-        } catch (Exception e) {
-            log.error("postProcess error for {}: {}", toolName, e.getMessage());
+    private String postProcess(String toolName, Map<String, Object> args, String toolResult, String userPrompt, String sessionId, AgentResult result) {
+        List<String> codes = extractCodesFromResult(toolResult);
+
+        if (sessionId != null && !sessionId.trim().isEmpty() && codes != null && !codes.isEmpty()) {
+            LAST_RESULTS.put(sessionId, new ArrayList<>(codes));
+            log.info("[Manual Info] Remembered {} codes for session {}", codes.size(), sessionId);
         }
         return toolResult;
-    }
-
-    // ── Extract location name from prompt ────────────────────────────
-    // e.g., "oldest monument in Lo Wu" → "Lo Wu"
-    // e.g., "playground in Sha Tin"    → "Sha Tin"
-    private String extractLocationFromPrompt(String prompt) {
-        Matcher m = Pattern.compile(
-                "(?i)\\b(?:in|at|near|located in|within)\\s+([A-Z][a-zA-Z\\s]{2,25}?)(?:\\s*\\?|,|\\.|$)",
-                Pattern.CASE_INSENSITIVE
-        ).matcher(prompt);
-        if (m.find()) {
-            String loc = m.group(1).trim();
-            // Remove trailing noise words
-            loc = loc.replaceAll("(?i)\\s+(has|have|with|that|which|is|are).*$", "").trim();
-            if (!loc.isEmpty()) {
-                log.info("[Manual Info] Extracted location filter: '{}'", loc);
-                return loc;
-            }
-        }
-        return null;
-    }
-
-    // ── Find oldest location by BLDG_COMPLETION_YEAR + fetch details ─
-    private String findOldestWithDetails(List<String> locCds,
-            AgentResult result) throws IOException {
-        String oldestCode = null;
-        String oldestName = null;
-        String oldestDept = null;
-        String oldestDeptDesc = null;
-        int oldestYear = Integer.MAX_VALUE;
-        // Fetch details for each candidate
-        for (String locCd : locCds) {
-            Map<String, Object> args = map("locCd", locCd);
-            String infoResult = mcpClient.callTool("hardcode_query", args);
-            result.addToolCall("hardcode_query", args, infoResult);
-            try {
-                JsonNode info = mapper.readTree(infoResult);
-                JsonNode general = info.path("general");
-                double yearRaw = general.path("BLDG_COMPLETION_YEAR").asDouble(0);
-                int year = (int) yearRaw;
-                String name = general.path("LOC_NAME").asText("").trim();
-                String dept = general.path("DEPT_CD").asText("").trim();
-                String deptDesc = general.path("DEPT_DESC").asText("").trim();
-                log.info("[Manual Info]  Checking {}: name='{}' year={} dept={}",
-                        locCd, name, year, dept);
-                if (year > 0 && year < oldestYear) {
-                    oldestYear = year;
-                    oldestCode = locCd;
-                    oldestName = name;
-                    oldestDept = dept;
-                    oldestDeptDesc = deptDesc;
-                }
-            } catch (Exception e) {
-                log.error("findOldestWithDetails error for {}: {}", locCd, e.getMessage());
-            }
-        }
-        // ── Build response JSON that the LLM can understand ───────────
-        Map<String, Object> response = new LinkedHashMap<String, Object>();
-        if (oldestCode != null) {
-            response.put("found", true);
-            response.put("LOC_CD", oldestCode);
-            response.put("LOC_NAME", oldestName);
-            response.put("DEPT_CD", oldestDept);
-            response.put("DEPT_DESC", oldestDeptDesc);
-            response.put("YEAR", oldestYear > 0 ? oldestYear : "unknown");
-            response.put("summary",
-                    "Oldest location: " + oldestName
-                    + " (" + oldestCode + ")"
-                    + (oldestYear > 0 ? ", completed " + oldestYear : "")
-                    + ", managed by: " + (oldestDept.isEmpty() ? oldestDeptDesc : oldestDept));
-            log.info("[Manual Info]✅ Oldest found: {} | {} | dept={} | year={}",
-                    oldestCode, oldestName, oldestDept, oldestYear);
-        } else {
-            response.put("found", false);
-            response.put("summary", "Could not determine oldest — "
-                    + "BLDG_COMPLETION_YEAR not available for candidates.");
-        }
-        return mapper.writeValueAsString(response);
     }
 
     private String filterResultsByLocation(String toolResult, String locationKeyword) {
@@ -3192,27 +3046,29 @@ public class OllamaService {
      * fails (caller should fallback gracefully).
      */
     public ExtractedKeywords extractKeywords(String userPrompt) {
-        boolean isRetry = userPrompt.contains("Previous answer was flagged");
-        String cacheKey = userPrompt.trim().toLowerCase();
-        if (!isRetry) {
-            // ── 1. CHECK REGEX TEMPLATE GATEWAY (0ms Fast Path) ──
-            ExtractedKeywords templateMatch = matchExactTemplatePrompt(userPrompt);
-            if (templateMatch != null) {
-                return templateMatch;
-            }
-            // ── 2. CHECK KEYWORD CACHE ──
-            ExtractedKeywords cached = kwCache.get(cacheKey);
-            if (cached != null) {
-                log.info("[Manual Info]Keyword cache hit");
-                return cached;
-            }
+        String cleanPrompt = stripRetryFeedback(userPrompt);
+        String cacheKey = cleanPrompt.trim().toLowerCase(Locale.ROOT);
+
+        ExtractedKeywords cached = kwCache.get(cacheKey);
+        if (cached != null) {
+            log.info("[Manual Info]Keyword cache hit");
+            return cached;
         }
-        // ── 3. FALL BACK TO OLLAMA LLM EXTRACTION ──
-        ExtractedKeywords result = extractKeywordsFromLlm(userPrompt);
-        if (result != null && !isRetry) {
+
+        ExtractedKeywords result = extractKeywordsFromLlm(cleanPrompt);
+        if (result != null) {
             kwCache.put(cacheKey, result);
         }
         return result;
+    }
+
+    private String stripRetryFeedback(String prompt) {
+        if (prompt == null) {
+            return "";
+        }
+        return prompt.replaceAll(
+                "(?s)\\s*\\[Previous answer was flagged:.*?\\]\\s*",
+                " ").trim();
     }
 
     // ── PRIVATE: actual LLM call ──────────────────────────────────
@@ -3223,7 +3079,7 @@ public class OllamaService {
                     + "\n\nExtract keywords from: " + userPrompt + " /nothink";
             log.debug("[Manual Debug] Keyword extract request → model={}",
                     useTencent ? tencentModel : ollamaModel);
-            // ✅ Routes to Tencent or Ollama based on config
+            // Routes to Tencent or Ollama based on config
             String responseText = callLlmSimple(fullPrompt, 0.0, useTencent ? tencentNumCtx : ollamaNumCtx);
             log.debug("[Manual Debug] Keyword extract response: {}", responseText);
             // ── Strip thinking tags and markdown fences ───────────────────
@@ -3271,7 +3127,7 @@ public class OllamaService {
                 }
             }
             result.setRawKeywords(rawList);
-            log.info("[Manual Info]✅ Keywords: intents={} primary={} location={} modifier={} dept={} grade={} filter={} showDetails={} plan={}",
+            log.info("[Manual Info]Keywords: intents={} primary={} location={} modifier={} dept={} grade={} filter={} showDetails={} plan={}",
                     result.getIntents(), result.getPrimaryIntent(), result.getLocationName(), result.getModifier(),
                     result.getDepartment(), result.getGrade(), result.getFilter(), result.isShowDetails(), result.getPlan());
             return result;
@@ -3325,14 +3181,39 @@ public class OllamaService {
                     if (e.getValue().isNull()) {
                         continue;
                     }
-                    String v = e.getValue().asText("").trim();
-                    if (!v.isEmpty()) {
-                        params.put(e.getKey(), v);
+
+                    JsonNode valueNode = e.getValue();
+                    if (valueNode == null || valueNode.isNull()) {
+                        continue;
                     }
+
+                    String value;
+                    if (valueNode.isArray()) {
+                        List<String> values = new ArrayList<>();
+                        for (JsonNode item : valueNode) {
+                            String itemValue = item.asText("").trim();
+                            if (!itemValue.isEmpty()) {
+                                values.add(itemValue);
+                            }
+                        }
+                        value = String.join(",", values);
+                    } else {
+                        value = valueNode.asText("").trim();
+                    }
+
+                    if (!value.isEmpty()) {
+                        params.put(e.getKey(), value);
+                    }
+
                 }
             }
+            String relation = nullIfEmpty(stepNode.path("relation").asText(""));
+            if (relation != null) {
+                params.put("relation", relation.trim().toLowerCase(Locale.ROOT));
+            }
+
             step.setParams(params);
-            step.setRelation(nullIfEmpty(stepNode.path("relation").asText("")));
+            step.setRelation(relation);
             steps.add(step);
         }
         return steps;
@@ -3371,191 +3252,90 @@ public class OllamaService {
      * is injected into args for ALL tools — DB does filtering. Returns null if
      * the intent cannot proceed (e.g. no codes for report check).
      */
-    private Map<String, Object> buildArgs(
-            Intent intent,
-            String lastToolResult,
-            List<String> lastCodes,
-            String sessionId) {
+    private Map<String, Object> buildArgs(Intent intent, String lastToolResult, List<String> lastCodes, String sessionId) {
+        if (intent == null) {
+            return null;
+        }
+
+        Map<String, String> params = intent.params == null
+                ? Collections.<String, String>emptyMap()
+                : intent.params;
+        ToolDefinition definition = mcpClient.resolveDefinition(intent.type, params);
+
+        if (definition == null) {
+            definition = mcpClient.resolveDefinition(intent.toolName, params);
+        }
+
+        if (definition == null) {
+            log.warn("No tool definition for intent={} tool={}", intent.type, intent.toolName);
+            return null;
+        }
+
+        Set<String> accepted = mcpClient.getAcceptedParameters(definition);
+
+        if (accepted == null) {
+            accepted = Collections.emptySet();
+        }
+
         Map<String, Object> args = new LinkedHashMap<String, Object>();
-        switch (intent.type) {
-            case Intent.LOCATION_CODE: {
-                String codesSource = intent.params.get("codesSource");
-                if ("history".equals(codesSource)) {
-                    args.put("_multiSource", "history");
-                    args.put("_codes", extractCurrentCodesFromHistory(lastToolResult));
-                } else if ("psm_first".equals(codesSource)
-                        || "previous_first".equals(codesSource)) {
-                    // Pick first code from previous tool result
-                    String firstCode = extractFirstCode(lastToolResult);
-                    if (firstCode == null) {
-                        log.warn(" codesSource=psm_first but no code in previous result");
-                        return null;
-                    }
-                    args.put("locCd", firstCode);
-                } else if ("use_previous_codes".equals(intent.params.get("relation"))) {
-                    // Use the previous step's LOC_CD list as input; pick the first one for hardcode_query
-                    List<String> codes = lastCodes.isEmpty() ? getLastResults(sessionId) : lastCodes;
-                    if (codes.isEmpty()) {
-                        return null;
-                    }
-                    args.put("locCd", codes.get(0));
-                } else {
-                    // Direct code from params
-                    String locCd = intent.params.get("locCd");
-                    String locCds = intent.params.get("locCds");
-                    if (locCd != null) {
-                        args.put("locCd", locCd);
-                    }
-                    if (locCds != null) {
-                        args.put("_multiCodes", locCds);
-                    }
-                }
-                break;
+
+        for (Map.Entry<String, String> entry : params.entrySet()) {
+            String key = entry.getKey();
+            String value = entry.getValue();
+
+            if (key == null
+                    || value == null
+                    || value.trim().isEmpty()
+                    || !accepted.contains(key)) {
+                continue;
             }
-            case Intent.NAME_SEARCH: {
-                String locName = intent.params.get("locName");
-                if (locName == null || locName.isEmpty()) {
-                    locName = intent.params.get("locationName");
+
+            if ("limit".equals(key)) {
+                try {
+                    args.put(key, Integer.valueOf(value.trim()));
+                } catch (NumberFormatException e) {
+                    log.warn("Ignoring invalid limit value: {}", value);
                 }
-                if (locName != null && !locName.isEmpty()) {
-                    args.put("locName", locName);
-                }
-                String location = getLocationFilter(intent);
-                if (location != null && !location.isEmpty()) {
-                    args.put("location", location);
-                }
-                String limitParam = intent.params.get("limit");
-                if (limitParam != null) {
-                    try {
-                        args.put("limit", Integer.parseInt(limitParam));
-                    } catch (NumberFormatException ignored) {
-                        // ignore malformed limit, let DatabaseManager use its default
-                    }
-                }
-                putExcludeUndefinedIfPresent(args, intent);
-                break;
+
+            } else if ("locCds".equals(key)) {
+                args.put(key, parseLocationCodes(value));
+            } else {
+                args.put(key, value.trim());
             }
-            case Intent.PSM_LIST: {
-                // No args needed — lists all PSMs
-                break;
+        }
+
+        String relation = getRelation(intent);
+
+        if ("use_previous_codes".equals(relation)) {
+            List<String> codes = lastCodes == null || lastCodes.isEmpty()
+                    ? getLastResults(sessionId)
+                    : lastCodes;
+            if (codes == null || codes.isEmpty()) {
+                log.warn("No previous location codes available for tool {}", definition.getToolName());
+                return null;
             }
-            case Intent.PSM_LOCATIONS: {
-                String psm = intent.params.get("psm");
-                if (psm != null) {
-                    args.put("psm", psm);
-                }
-                String location = getLocationFilter(intent);
-                if (location != null && !location.isEmpty()) {
-                    args.put("location", location);
-                }
-                //pass through a limit if one was captured either in the
-                // step's own params (LLM plan) or extracted from the raw prompt.
-                String limitParam = intent.params.get("limit");
-                if (limitParam != null) {
-                    try {
-                        args.put("limit", Integer.parseInt(limitParam));
-                    } catch (NumberFormatException ignored) {
-                        // ignore malformed limit, let DatabaseManager use its default
-                    }
-                }
-                putExcludeUndefinedIfPresent(args, intent);
-                break;
-            }
-            case Intent.CODE_HISTORY: {
-                // ── Primary lookup keys ───────────────────────────────────
-                String locCd = intent.params.get("locCd");
-                String formerLocCd = intent.params.get("formerLocCd");
-                String currentLocCd = intent.params.get("currentLocCd");
-                if (locCd != null) {
-                    // Search by either former or current — DB handles both
-                    args.put("formerLocCd", locCd);
-                    args.put("currentLocCd", locCd);
-                }
-                if (formerLocCd != null) {
-                    args.put("formerLocCd", formerLocCd);
-                }
-                if (currentLocCd != null) {
-                    args.put("currentLocCd", currentLocCd);
-                }
-                break;
-            }
-            case Intent.CHECK_REPORTS: {
-                String reportType = intent.params.get("reportType");
-                String codesSource = intent.params.get("codesSource");
-                String inlineCds = intent.params.get("locCds");
-                String relation = intent.params.get("relation");
-                List<String> codesToCheck;
-                if ("use_previous_codes".equals(relation)) {
-                    codesToCheck = lastCodes.isEmpty() ? getLastResults(sessionId) : lastCodes;
-                } else if (codesSource != null && !lastCodes.isEmpty()) {
-                    codesToCheck = lastCodes;
-                } else if (codesSource != null) {
-                    codesToCheck = getLastResults(sessionId);
-                } else if (inlineCds != null) {
-                    codesToCheck = Arrays.asList(inlineCds.split(","));
-                } else {
-                    codesToCheck = getLastResults(sessionId);
-                }
-                if (codesToCheck == null || codesToCheck.isEmpty()) {
+
+            if (accepted.contains("locCds")) {
+                args.put("locCds", new ArrayList<String>(codes));
+            } else if (accepted.contains("locCd")) {
+                if (codes.size() != 1) {
+                    log.warn("Singular tool {} requires exactly one code; received {}",
+                            definition.getToolName(), codes.size());
                     return null;
                 }
-                if (reportType != null) {
-                    args.put("reportType", reportType);
-                }
-                args.put("locCds", codesToCheck);
-                break;
+                args.put("locCd", codes.get(0));
+            } else {
+                log.warn("Tool {} accepts neither locCds nor locCd", definition.getToolName());
+                return null;
             }
-            case Intent.DECLARED_MONUMENT: {
-                String filter = intent.params.getOrDefault("filter", "T");
-                args.put("filter", filter);
-                String location = getLocationFilter(intent);
-                if (location != null && !location.isEmpty()) {
-                    args.put("location", location);
-                }
-                putExcludeUndefinedIfPresent(args, intent);
-                break;
+        }
+        String codesSource = params.get("codesSource");
+        if ("previous_first".equals(codesSource) && accepted.contains("locCd")) {
+            String firstCode = extractFirstCode(lastToolResult);
+            if (firstCode == null || firstCode.trim().isEmpty()) {
+                return null;
             }
-            case Intent.HISTORIC_BUILDING: {
-                String grade = intent.params.getOrDefault("grade", "ALL");
-                args.put("grade", grade);
-                String location = getLocationFilter(intent);
-                if (location != null && !location.isEmpty()) {
-                    args.put("location", location);
-                }
-                String limitParam = intent.params.get("limit");
-                if (limitParam != null) {
-                    try {
-                        args.put("limit", Integer.parseInt(limitParam));
-                    } catch (NumberFormatException ignored) {
-                        // ignore malformed limit, let DatabaseManager use its default
-                    }
-                }
-                putExcludeUndefinedIfPresent(args, intent);
-                break;
-            }
-            case Intent.DEPARTMENT_LOCATIONS: {
-                String deptCd = intent.params.get("deptCd");
-                if (deptCd != null) {
-                    args.put("deptCd", deptCd);
-                }
-                String location = getLocationFilter(intent);
-                if (location != null && !location.isEmpty()) {
-                    args.put("location", location);
-                }
-                String limitParam = intent.params.get("limit");
-                if (limitParam != null) {
-                    try {
-                        args.put("limit", Integer.parseInt(limitParam));
-                    } catch (NumberFormatException ignored) {
-                        // ignore malformed limit, let DatabaseManager use its default
-                    }
-                }
-                putExcludeUndefinedIfPresent(args, intent);
-                break;
-            }
-            default:
-                log.warn(" Unknown intent type in buildArgs: {}", intent.type);
-                break;
+            args.put("locCd", firstCode.trim().toUpperCase());
         }
         return args;
     }
@@ -3564,8 +3344,17 @@ public class OllamaService {
      * Maps IntentType → MCP tool name. Single source of truth for all tool name
      * bindings.
      */
-    private String resolveToolName(String type) {
-        return Intent.resolveToolName(type);
+    private String resolveToolName(Intent intent) {
+        if (intent == null) {
+            return null;
+        }
+        if (intent.toolName != null && !intent.toolName.trim().isEmpty()) {
+            return intent.toolName.trim();
+        }
+        Map<String, String> params = intent.params == null
+                ? Collections.<String, String>emptyMap() : intent.params;
+        ToolDefinition definition = mcpClient.resolveDefinition(intent.type, params);
+        return definition == null ? null : definition.getToolName();
     }
 
     /**
@@ -3574,64 +3363,63 @@ public class OllamaService {
      * location with largest BLDG_COMPLETION_YEAR FIRST → take first result only
      * COUNT → return count summary only No modifier → return result unchanged
      */
-    private String applyModifier(Intent intent,
-            String toolResult,
-            AgentResult result) throws IOException {
-        String modifier = intent.params.get("modifier");
-        if (modifier == null || modifier.isEmpty()) {
-            return toolResult; // Nothing to do
+    private String applyModifier(Intent intent, String toolResult, AgentResult result) throws IOException {
+        if (intent == null || intent.params == null) {
+            return toolResult;
         }
-        modifier = modifier.toUpperCase();
-        log.info("[Manual Info]Applying modifier: {} to {} results",
-                modifier, extractCodesFromResult(toolResult).size());
+
+        String modifier = intent.params.get("modifier");
+        if (modifier == null || modifier.trim().isEmpty()) {
+            return toolResult;
+        }
+
+        modifier = modifier.trim().toUpperCase();
+        log.info("[Manual Info] Applying modifier {} to {} result codes", modifier, extractCodesFromResult(toolResult).size());
+
         switch (modifier) {
             case "OLDEST":
             case "EARLIEST": {
                 List<String> codes = extractCodesFromResult(toolResult);
                 if (codes.isEmpty()) {
-                    log.warn(" OLDEST modifier: no codes to compare");
                     return toolResult;
                 }
-                log.info("[Manual Info] Finding OLDEST among {} locations", codes.size());
-                return findByYear(codes, false, result); // false = find minimum year
+                return findByYear(codes, false, result);
             }
             case "NEWEST":
             case "LATEST": {
                 List<String> codes = extractCodesFromResult(toolResult);
                 if (codes.isEmpty()) {
-                    log.warn(" NEWEST modifier: no codes to compare");
                     return toolResult;
                 }
-                log.info("[Manual Info] Finding NEWEST among {} locations", codes.size());
-                return findByYear(codes, true, result); // true = find maximum year
+                return findByYear(codes, true, result);
             }
             case "FIRST": {
                 String firstCode = extractFirstCode(toolResult);
-                if (firstCode == null) {
+                if (firstCode == null || firstCode.trim().isEmpty()) {
                     return toolResult;
                 }
-                log.info("[Manual Info]1️⃣ Taking FIRST result: {}", firstCode);
-                Map<String, Object> args = map("locCd", firstCode);
-                String r = mcpClient.callTool("hardcode_query", args);
-                result.addToolCall("hardcode_query", args, r);
-                return r;
+
+                String detailTool = resolveDetailToolName(firstCode);
+                if (detailTool == null) {
+                    log.warn("No location-detail tool is registered");
+                    return toolResult;
+                }
+
+                Map<String, Object> detailArgs = map("locCd", firstCode.trim().toUpperCase());
+                String detailResult = mcpClient.callTool(detailTool, detailArgs);
+                result.addToolCall(detailTool, detailArgs, detailResult);
+                return detailResult;
             }
             case "COUNT": {
-                // Wrap in a count-only response
                 List<String> codes = extractCodesFromResult(toolResult);
-                log.info("[Manual Info]🔢 COUNT modifier: {} results", codes.size());
-                try {
-                    Map<String, Object> response = new LinkedHashMap<String, Object>();
-                    response.put("count", codes.size());
-                    response.put("summary", "Found " + codes.size() + " matching location(s).");
-                    response.put("found", codes.size() > 0);
-                    return mapper.writeValueAsString(response);
-                } catch (Exception e) {
-                    return toolResult;
-                }
+                Map<String, Object> response = new LinkedHashMap<>();
+                response.put("count", codes.size());
+                response.put("summary", "Found " + codes.size() + " matching location(s).");
+                response.put("found", !codes.isEmpty());
+                return mapper.writeValueAsString(response);
             }
             default:
-                log.warn(" Unknown modifier: {}", modifier);
+                log.warn("Unknown modifier: {}", modifier);
                 return toolResult;
         }
     }
@@ -3640,91 +3428,90 @@ public class OllamaService {
      * Finds location with min (oldest) or max (newest) BLDG_COMPLETION_YEAR.
      * Replaces the old findOldestWithDetails — now handles both directions.
      */
-    private String findByYear(List<String> locCds,
-            boolean findMax,
-            AgentResult result) throws IOException {
-
+    private String findByYear(List<String> locCds, boolean findMax, AgentResult result) throws IOException {
         if (locCds == null || locCds.isEmpty()) {
-            Map<String, Object> response = new LinkedHashMap<String, Object>();
+            Map<String, Object> response = new LinkedHashMap<>();
             response.put("found", false);
             response.put("summary", "No candidates to compare.");
             return mapper.writeValueAsString(response);
         }
 
-        // Cap defensively — even with batching, comparing thousands of rows
-        // for one user question is excessive; 200 matches the TOP 200 already
-        // used everywhere else in this codebase.
-        List<String> capped = locCds.size() > 200 ? locCds.subList(0, 200) : locCds;
-
-        log.info("[Manual Info] findByYear: batch-fetching {} candidates in ONE query "
-                + "(was: {} individual hardcode_query calls)", capped.size(), capped.size());
+        List<String> capped = locCds.size() > 200 ? new ArrayList<>(locCds.subList(0, 200)) : new ArrayList<>(locCds);
+        log.info("[Manual Info] Comparing {} location candidates by completion year", capped.size());
 
         List<Map<String, Object>> rows = DatabaseManager.getInstance().getGeneralInfoBatch(capped);
-
-        String bestCode = null;
-        String bestName = null;
-        String bestDept = null;
-        String bestDeptDesc = null;
+        String bestCode = null, bestName = null, bestDept = null, bestDeptDesc = null;
         int bestYear = findMax ? Integer.MIN_VALUE : Integer.MAX_VALUE;
 
         for (Map<String, Object> row : rows) {
-            Object yearObj = row.get("BLDG_COMPLETION_YEAR");
-            int year;
-            try {
-                year = yearObj == null ? 0 : (int) Double.parseDouble(yearObj.toString());
-            } catch (NumberFormatException nfe) {
+            if (row == null) {
                 continue;
             }
-            boolean isBetter = year > 0 && (findMax ? year > bestYear : year < bestYear);
-            if (isBetter) {
-                bestYear = year;
-                bestCode = (String) row.get("LOC_CD");
-                bestName = (String) row.get("LOC_NAME");
-                bestDept = (String) row.get("DEPT_CD");
-                bestDeptDesc = (String) row.get("DEPT_DESC");
+            Object yearValue = row.get("BLDG_COMPLETION_YEAR");
+            int year;
+
+            try {
+                year = yearValue == null ? 0 : (int) Double.parseDouble(yearValue.toString());
+            } catch (NumberFormatException e) {
+                continue;
             }
+
+            boolean better = year > 0 && (findMax ? year > bestYear : year < bestYear);
+            if (!better) {
+                continue;
+            }
+
+            bestYear = year;
+            Object codeValue = row.get("LOC_CD");
+            Object nameValue = row.get("LOC_NAME");
+            Object deptValue = row.get("DEPT_CD");
+            Object deptDescValue = row.get("DEPT_DESC");
+
+            bestCode = codeValue == null ? null : codeValue.toString();
+            bestName = nameValue == null ? "" : nameValue.toString();
+            bestDept = deptValue == null ? "" : deptValue.toString();
+            bestDeptDesc = deptDescValue == null ? "" : deptDescValue.toString();
         }
 
-        Map<String, Object> response = new LinkedHashMap<String, Object>();
-        if (bestCode != null) {
-            String label = findMax ? "Newest" : "Oldest";
-            String managedBy = (bestDept != null && !bestDept.isEmpty()) ? bestDept : bestDeptDesc;
-            response.put("found", true);
-            response.put("LOC_CD", bestCode);
-            response.put("LOC_NAME", bestName);
-            response.put("DEPT_CD", bestDept);
-            response.put("DEPT_DESC", bestDeptDesc);
-            response.put("YEAR", bestYear > 0 ? bestYear : "unknown");
-            response.put("summary",
-                    label + " location: " + bestName
-                    + " (" + bestCode + ")"
-                    + (bestYear > 0 ? ", completed " + bestYear : "")
-                    + ", managed by: " + managedBy);
-            log.info("[Manual Info]✅ {} found: {} | {} | dept={} | year={} (1 batch query + 0 extra lookups)",
-                    label, bestCode, bestName, bestDept, bestYear);
-
-            // Only ONE hardcode_query call, for the actual winner, so the
-            // formatter can render its full detail card (map, reports, etc.)
-            // exactly like the old code did for every candidate — just once now.
-            Map<String, Object> detailArgs = map("locCd", bestCode);
-            String detailResult = mcpClient.callTool("hardcode_query", detailArgs);
-            result.addToolCall("hardcode_query", detailArgs, detailResult);
-            return detailResult;
-        } else {
+        Map<String, Object> response = new LinkedHashMap<>();
+        if (bestCode == null || bestCode.trim().isEmpty()) {
             response.put("found", false);
-            response.put("summary", "Could not determine "
-                    + (findMax ? "newest" : "oldest")
-                    + " — BLDG_COMPLETION_YEAR not available for candidates.");
+            response.put("summary", "Could not determine " + (findMax ? "newest" : "oldest") + " location because completion-year data was unavailable.");
             return mapper.writeValueAsString(response);
         }
+
+        String label = findMax ? "Newest" : "Oldest";
+        String managedBy = bestDept != null && !bestDept.trim().isEmpty() ? bestDept : bestDeptDesc;
+
+        response.put("found", true);
+        response.put("LOC_CD", bestCode);
+        response.put("LOC_NAME", bestName);
+        response.put("DEPT_CD", bestDept);
+        response.put("DEPT_DESC", bestDeptDesc);
+        response.put("YEAR", bestYear > 0 ? bestYear : "unknown");
+        response.put("summary", label + " location: " + bestName + " (" + bestCode + ")" + (bestYear > 0 ? ", completed " + bestYear : "") + (managedBy == null || managedBy.trim().isEmpty() ? "" : ", managed by: " + managedBy));
+
+        String detailTool = resolveDetailToolName(bestCode);
+        if (detailTool == null) {
+            log.warn("No location-detail tool is registered");
+            return mapper.writeValueAsString(response);
+        }
+
+        Map<String, Object> detailArgs = map("locCd", bestCode);
+        String detailResult = mcpClient.callTool(detailTool, detailArgs);
+        result.addToolCall(detailTool, detailArgs, detailResult);
+
+        return detailResult;
     }
 
     /**
      * Ask the LLM to generate a SQL query, then execute it. Used as last resort
      * when no tool matches the user's question.
      */
-    private String generateAndExecuteSql(String userPrompt,
-            ExtractedKeywords keywords) throws IOException {
+    private String generateAndExecuteSql(
+            String userPrompt,
+            ExtractedKeywords keywords,
+            AuthorizationContext authorizationContext) throws IOException {
         log.info("[Manual Info]Generating SQL for: '{}'", userPrompt);
         // ── Build context clues ───────────────────────────────────────
         StringBuilder question = new StringBuilder();
@@ -3775,7 +3562,7 @@ public class OllamaService {
                 + " /nothink";
         log.debug("[Manual Debug] SQL generate request → model={}",
                 useTencent ? tencentModel : ollamaModel);
-        // ✅ Routes to Tencent or Ollama based on config
+        // Routes to Tencent or Ollama based on config
         String generatedSql = callLlmSimple(fullPrompt, 0.0, 1500);
         // ── Strip thinking tags and markdown fences ───────────────────
         generatedSql = stripThinkingTags(generatedSql);
@@ -3785,10 +3572,35 @@ public class OllamaService {
             return "{\"error\":\"LLM returned empty SQL\"}";
         }
         generatedSql = validateLlmSql(generatedSql);
-        log.info("[Manual Info]LLM generated SQL: {}", generatedSql);
-        // ── Execute the generated SQL ─────────────────────────────────
+        log.debug("[Security] Generated SQL length={}",
+                generatedSql.length());
+
+        // ── SQL FIREWALL ───────────────────────────────────────────────
+        if (!isSqlSafe(generatedSql)) {
+            log.error("[Security] SQL firewall BLOCKED: {}",
+                    generatedSql.substring(0, Math.min(200, generatedSql.length())));
+            return "{\"error\":\"Generated SQL blocked by security firewall\"}";
+        }
+        // Execute the generated SQL and measure the actual database call.
+        long sqlStartMs = System.currentTimeMillis();
+
         Map<String, Object> queryResult
-                = DatabaseManager.getInstance().executeLlmGeneratedQuery(generatedSql);
+                = DatabaseManager.getInstance()
+                        .executeLlmGeneratedQuery(
+                                generatedSql,
+                                authorizationContext
+                        );
+
+        long durationMs = System.currentTimeMillis() - sqlStartMs;
+
+        Object countValue = queryResult.get("count");
+        long rowCount = countValue instanceof Number
+                ? ((Number) countValue).longValue()
+                : -1L;
+
+        log.info("LLM SQL request completed: rows={}, durationMs={}",
+                rowCount, durationMs);
+
         return mapper.writeValueAsString(queryResult);
     }
 
@@ -3810,113 +3622,6 @@ public class OllamaService {
             return String.join(" ", candidates);
         }
         return null;
-    }
-
-    /**
-     * Runs post-step chain actions after a tool call completes. Each chain
-     * action is self-contained and only fires when its trigger condition is
-     * met.
-     *
-     * Adding a new chain = add one entry to the chains list. No changes needed
-     * to executePlan itself.
-     */
-    private String runPostStepChains(
-            Intent intent,
-            String toolResult,
-            List<String> lastCodes,
-            AgentResult result,
-            String sessionId) throws IOException {
-        StringBuilder html = new StringBuilder();
-        // ── Registered chain actions ──────────────────────────────────
-        // Each chain is a pair of: (trigger condition, action)
-        // They run in order — first match wins, or all can run.
-        // ── Chain 1: CODE_HISTORY + autoFetchCurrent ──────────────────
-        // Trigger: CODE_HISTORY intent with autoFetchCurrent=true
-        // Action:  fetch full details for each current code found
-        if (intent.type == Intent.CODE_HISTORY) {
-            String searchedCode = intent.params.get("locCd");
-            if (searchedCode == null || searchedCode.trim().isEmpty()) {
-                searchedCode = intent.params.get("formerLocCd");
-            }
-            if (searchedCode == null || searchedCode.trim().isEmpty()) {
-                searchedCode = intent.params.get("currentLocCd");
-            }
-            final String searched = searchedCode != null
-                    ? searchedCode.trim().toUpperCase()
-                    : null;
-            List<String> currentCodes = extractCurrentCodesFromHistory(toolResult);
-            log.info("[Manual Info]CODE_HISTORY searched={}, currentCodes={}", searched, currentCodes);
-            // ── Check if searched code is NOT in currentCodes ──────────
-            // If not current → it is former → auto-trigger hardcode_query
-            boolean searchedIsCurrent = false;
-            if (searched != null) {
-                for (String c : currentCodes) {
-                    if (c != null && searched.equalsIgnoreCase(c.trim())) {
-                        searchedIsCurrent = true;
-                        break;
-                    }
-                }
-            }
-            boolean shouldAutoFetch = searched != null
-                    && !currentCodes.isEmpty()
-                    && !searchedIsCurrent;
-            log.info("[Manual Info] searchedIsCurrent={}, shouldAutoFetch={}",
-                    searchedIsCurrent, shouldAutoFetch);
-            if (shouldAutoFetch) {
-                log.info("[Manual Info]'{}' is former code → auto-trigger hardcode_query for {}",
-                        searched, currentCodes);
-                for (String currentCd : currentCodes) {
-                    Map<String, Object> detailArgs = map("locCd", currentCd);
-                    String detailResult = mcpClient.callTool("hardcode_query", detailArgs);
-                    result.addToolCall("hardcode_query", detailArgs, detailResult);
-                    html.append("<div style='margin-top:16px;border-top:2px solid #f0a500;padding-top:16px;'>")
-                            .append("<p class='answer-summary'><i class='fa-solid fa-map-pin'></i> Current code: <code>")
-                            .append(escapeHtml(currentCd))
-                            .append("</code></p>")
-                            .append(formatAsHtml(detailResult))
-                            .append("</div>");
-                }
-            }
-        }
-        // ── Chain 2: PSM_LOCATIONS + autoFetchFirst ───────────────────
-        // Trigger: PSM_LOCATIONS intent with autoFetchFirst=true
-        // Action:  fetch full details for first location in results
-        if (intent.type == Intent.PSM_LOCATIONS
-                && "true".equals(intent.params.get("autoFetchFirst"))
-                && !lastCodes.isEmpty()) {
-            String firstCode = lastCodes.get(0);
-            log.info("[Manual Info]Chain: PSM_LOCATIONS → auto-fetch first location: {}", firstCode);
-            Map<String, Object> detailArgs = map("locCd", firstCode);
-            String detailResult = mcpClient.callTool("hardcode_query", detailArgs);
-            result.addToolCall("hardcode_query", detailArgs, detailResult);
-            html.append("<div style='margin-top:16px;"
-                    + "border-top:2px solid #0f3460;"
-                    + "padding-top:16px;'>");
-            html.append(formatAsHtml(detailResult));
-            html.append("</div>");
-        }
-        // ── Chain 3: Any intent + autoCheckReports ────────────────────
-        // Trigger: any intent with autoCheckReports=BSI,KAI,DSSR etc.
-        // Action:  run check_reports for each report type over lastCodes
-        String autoCheckReports = intent.params.get("autoCheckReports");
-        if (autoCheckReports != null
-                && !autoCheckReports.isEmpty()
-                && !lastCodes.isEmpty()) {
-            log.info("[Manual Info]Chain: auto-check reports {} for {} codes",
-                    autoCheckReports, lastCodes.size());
-            for (String rType : autoCheckReports.split(",")) {
-                rType = rType.trim();
-                Map<String, Object> reportArgs = new LinkedHashMap<String, Object>();
-                reportArgs.put("reportType", rType);
-                reportArgs.put("locCds", lastCodes);
-                String reportResult = mcpClient.callTool("check_reports", reportArgs);
-                result.addToolCall("check_reports", reportArgs, reportResult);
-                html.append(formatAsHtml(reportResult));
-            }
-        }
-        // ── Add more chains here as needed ────────────────────────────
-        // Pattern: if (intent.type == X && intent.params.containsKey("Y")) { ... }
-        return html.toString();
     }
 
     /**
@@ -3944,6 +3649,60 @@ public class OllamaService {
             }
         }
         return corrected;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // SQL FIREWALL (ProjectReview P0 — Issue #7)
+    // ══════════════════════════════════════════════════════════════
+    /**
+     * Returns true if the LLM-generated SQL is safe to execute. Blocks:
+     * non-SELECT, DDL/DML, multi-statement, embedded comments.
+     */
+    private boolean isSqlSafe(String sql) {
+        if (sql == null || sql.trim().isEmpty()) {
+            return false;
+        }
+        String trimmed = sql.trim();
+        String upper = trimmed.toUpperCase().replaceAll("\\s+", " ").trim();
+
+        // 1. Must start with SELECT or WITH (CTE)
+        if (!upper.startsWith("SELECT") && !upper.startsWith("WITH")) {
+            log.warn("[Security] SQL firewall BLOCKED non-SELECT: {}",
+                    trimmed.substring(0, Math.min(80, trimmed.length())));
+            return false;
+        }
+
+        // 2. Block dangerous keywords
+        if (SQL_DANGEROUS_PATTERN.matcher(trimmed).find()) {
+            log.warn("[Security] SQL firewall BLOCKED dangerous keyword: {}",
+                    trimmed.substring(0, Math.min(80, trimmed.length())));
+            return false;
+        }
+
+        // 3. Block multi-statement (semicolons outside quotes)
+        int semicolons = 0;
+        boolean inQuote = false;
+        for (int i = 0; i < trimmed.length(); i++) {
+            char c = trimmed.charAt(i);
+            if (c == '\'') {
+                inQuote = !inQuote;
+            } else if (c == ';' && !inQuote) {
+                semicolons++;
+            }
+        }
+        if (semicolons > 0) {
+            log.warn("[Security] SQL firewall BLOCKED multi-statement ({} semicolons)", semicolons);
+            return false;
+        }
+
+        // 4. Block embedded SQL comments (can hide malicious payloads)
+        String noTrailing = trimmed.replaceAll("--[^\\n]*$", "").trim();
+        if (noTrailing.contains("--") || noTrailing.contains("/*")) {
+            log.warn("[Security] SQL firewall BLOCKED embedded comments");
+            return false;
+        }
+
+        return true;
     }
 
     /**
@@ -4090,16 +3849,10 @@ public class OllamaService {
             "\\b(these|those|this location|that location|them|the above|previous locations)\\b",
             Pattern.CASE_INSENSITIVE
     );
-    // ── Prompt patterns that want info/details ────────────────────────────
-    private static final Pattern INFO_REQUEST_PATTERN = Pattern.compile(
-            "(?i)^(get|show|find|fetch|display|tell me|give me|what is|info|"
-            + "details|information|retrieve)\\b"
-    );
-    
+
     private static final Pattern LIMIT_PATTERN = Pattern.compile(
             "(?i)\\b(?:top|first)\\s+(\\d{1,4})\\b"
     );
-    
 
     /**
      * If the prompt contains referential words ("that", "it", "those") AND the
@@ -4183,116 +3936,6 @@ public class OllamaService {
         return this.invoke(prompt, sessionId);
     }
 
-    private List<String> extractFormerCodesFromHistory(String historyResult) {
-        List<String> codes = new ArrayList<>();
-        if (historyResult == null || historyResult.isEmpty()) {
-            return codes;
-        }
-        try {
-            com.fasterxml.jackson.databind.ObjectMapper mapper
-                    = new com.fasterxml.jackson.databind.ObjectMapper();
-            String jsonStr = historyResult.trim();
-            if (jsonStr.startsWith("{") && jsonStr.contains("\"rows\"")) {
-                com.fasterxml.jackson.databind.JsonNode root = mapper.readTree(jsonStr);
-                if (root.has("rows")) {
-                    jsonStr = root.get("rows").toString();
-                }
-            }
-            if (jsonStr.startsWith("[")) {
-                for (com.fasterxml.jackson.databind.JsonNode row : mapper.readTree(jsonStr)) {
-                    if (row.has("FORMER_LOC_CD") && !row.get("FORMER_LOC_CD").isNull()) {
-                        String cd = row.get("FORMER_LOC_CD").asText().trim().toUpperCase();
-                        if (!cd.isEmpty() && !codes.contains(cd)) {
-                            codes.add(cd);
-                        }
-                    }
-                }
-            }
-        } catch (Exception e) {
-            // Fallback: regex
-            java.util.regex.Matcher m = java.util.regex.Pattern
-                    .compile("FORMER_LOC_CD[\":\\s]+([A-Z]{2}\\d{11})",
-                            java.util.regex.Pattern.CASE_INSENSITIVE)
-                    .matcher(historyResult);
-            while (m.find()) {
-                String cd = m.group(1).toUpperCase();
-                if (!codes.contains(cd)) {
-                    codes.add(cd);
-                }
-            }
-        }
-        return codes;
-    }
-
-    private ExtractedKeywords matchExactTemplatePrompt(String prompt) {
-        if (prompt == null) {
-            return null;
-        }
-        String clean = prompt.trim();
-        
-        // ── SCALABILITY GUARD: If the prompt contains natural language filter words, ──
-        // ── bypass dumb regex templates and let the LLM handle semantic reasoning! ──
-        if (clean.matches("(?i).*\\b(with|without|not|non|has|have|having|excluding|except|where|in|at|near)\\b.*")) {
-            log.info("[Manual Info] Natural language filter detected in prompt — bypassing regex template gateway to let LLM reason.");
-            return null;
-        }
-        
-        // Template 1: "Get info for [LOC_CD]"
-        Matcher mInfo = Pattern.compile("(?i)^Get info for ([A-Z0-9]{11,15})$").matcher(clean);
-        if (mInfo.matches()) {
-            ExtractedKeywords kw = new ExtractedKeywords();
-            kw.setIntents(Collections.singletonList("LOCATION_CODE"));
-            kw.setLocationCode(mInfo.group(1).toUpperCase());
-            log.info("[Manual Info]Exact Template Match: Get info for {}", kw.getLocationCode());
-            return kw;
-        }
-        // Template 2: "Show locations for department [DEPT]"
-        Matcher mDept = Pattern.compile("(?i)^Show locations for department ([A-Z]{2,6})$").matcher(clean);
-        if (mDept.matches()) {
-            ExtractedKeywords kw = new ExtractedKeywords();
-            kw.setIntents(Collections.singletonList("DEPARTMENT"));
-            kw.setDepartment(mDept.group(1).toUpperCase());
-            log.info("[Manual Info]Exact Template Match: Show locations for department {}", kw.getDepartment());
-            return kw;
-        }
-        // Template 3: "Show locations under PSM [PSM_NAME]"
-        Matcher mPsm = Pattern.compile(
-                "(?i)^Show (?:(?:top|first)\\s+(\\d{1,4})\\s+)?locations under PSM/?([A-Z0-9 .&()_-]+)$"
-        ).matcher(clean);
-        if (mPsm.matches()) {
-            ExtractedKeywords kw = new ExtractedKeywords();
-            kw.setIntents(Collections.singletonList("PSM"));
-            kw.setPsm(mPsm.group(2).trim().toUpperCase());
-            if (mPsm.group(1) != null) {
-                try {
-                    kw.setLimit(Integer.parseInt(mPsm.group(1)));
-                } catch (NumberFormatException ignored) {
-                    // leave limit unset -> DatabaseManager default applies
-                }
-            }
-            log.info("[Manual Info]Exact Template Match: Show locations under PSM {} (limit={})",
-                    kw.getPsm(), kw.getLimit());
-            return kw;
-        }
-        // Template 4: "List all PSMs"
-        if (clean.equalsIgnoreCase("List all PSMs") || clean.equalsIgnoreCase("show PSMs")) {
-            ExtractedKeywords kw = new ExtractedKeywords();
-            kw.setIntents(Collections.singletonList("PSM"));
-            log.info("[Manual Info]Exact Template Match: List all PSMs");
-            return kw;
-        }
-        // Template 5: "Search location code history for [LOC_CD]"
-        Matcher mHist = Pattern.compile("(?i)^Search location code history for ([A-Z0-9]{11,15})$").matcher(clean);
-        if (mHist.matches()) {
-            ExtractedKeywords kw = new ExtractedKeywords();
-            kw.setIntents(Collections.singletonList("CODE_HISTORY"));
-            kw.setLocationCode(mHist.group(1).toUpperCase());
-            log.info("[Manual Info]Exact Template Match: Search location code history for {}", kw.getLocationCode());
-            return kw;
-        }
-        return null; // No exact match -> Fall back to Ollama LLM Extraction!
-    }
-
     /**
      * Returns a human-readable description of a plan step for the intersection
      * summary. e.g., "BSI report", "Grade 1 historic", "Declared monument",
@@ -4337,47 +3980,6 @@ public class OllamaService {
         }
     }
 
-    /**
-     * Wrapper for check_reports that handles "ALL" and comma-separated report
-     * types. Expands into individual calls and returns combined HTML.
-     */
-    private String callCheckReports(String reportType, List<String> locCds, AgentResult result) throws IOException {
-        // Handle "ALL" — expand to all standard report types
-        if ("ALL".equalsIgnoreCase(reportType)) {
-            return callCheckReports("BSI,CSR,KAI,EMMS,DSSR", locCds, result);
-        }
-
-        // Handle comma-separated types (e.g., "BSI,KAI")
-        if (reportType != null && reportType.contains(",")) {
-            StringBuilder combinedHtml = new StringBuilder();
-
-            for (String type : reportType.split(",")) {
-                type = type.trim();
-                if (type.isEmpty()) {
-                    continue;
-                }
-
-                Map<String, Object> singleArgs = new LinkedHashMap<String, Object>();
-                singleArgs.put("reportType", type);
-                singleArgs.put("locCds", locCds);
-
-                log.info("[Manual Info]Tool: check_reports (expanded) args: {}", singleArgs);
-                String singleResult = mcpClient.callTool("check_reports", singleArgs);
-                result.addToolCall("check_reports", singleArgs, singleResult);
-                combinedHtml.append(formatAsHtml(singleResult));
-            }
-
-            return combinedHtml.toString();
-        }
-
-        // Single type — call directly
-        Map<String, Object> args = new LinkedHashMap<String, Object>();
-        args.put("reportType", reportType);
-        args.put("locCds", locCds);
-
-        return mcpClient.callTool("check_reports", args);
-    }
-    
     private String buildCallKey(String toolName, Map<String, Object> args) {
         if (args == null || args.isEmpty()) {
             return toolName + "|{}";
@@ -4398,14 +4000,14 @@ public class OllamaService {
             return toolName + "|" + normalized.toString();
         }
     }
-    
+
     /**
      * Extracts a "top N" / "first N" row limit from free text, if present.
      * Returns null if no such phrase is found, so callers can fall back to
-     * DatabaseManager's own default. Capped to 4 digits at the regex level
-     * (max 9999) as a first line of defense; DatabaseManager itself clamps
-     * to MAX_PSM_LOCATIONS_LIMIT regardless, so this is defense-in-depth,
-     * not the only safeguard.
+     * DatabaseManager's own default. Capped to 4 digits at the regex level (max
+     * 9999) as a first line of defense; DatabaseManager itself clamps to
+     * MAX_PSM_LOCATIONS_LIMIT regardless, so this is defense-in-depth, not the
+     * only safeguard.
      */
     private Integer extractLimitFromPrompt(String prompt) {
         if (prompt == null) {
@@ -4421,11 +4023,211 @@ public class OllamaService {
         }
         return null;
     }
-    
+
     private void putExcludeUndefinedIfPresent(Map<String, Object> args, Intent intent) {
         String field = intent.params.get("excludeUndefinedField");
         if (field != null && !field.trim().isEmpty()) {
             args.put("excludeUndefinedField", field.trim().toLowerCase());
         }
     }
+
+    private List<String> parseLocationCodes(String value) {
+        List<String> codes = new ArrayList<String>();
+        if (value == null || value.trim().isEmpty()) {
+            return codes;
+        }
+        for (String part : value.split(",")) {
+            String code = part.trim().toUpperCase();
+            if (!code.isEmpty()) {
+                codes.add(code);
+            }
+        }
+        return codes;
+    }
+
+    private String resolveDetailToolName() {
+        return resolveDetailToolName(null);
+    }
+
+    private String resolveDetailToolName(String locationCode) {
+        Map<String, String> params = new LinkedHashMap<>();
+
+        if (locationCode != null && !locationCode.trim().isEmpty()) {
+            params.put("locCd", locationCode.trim().toUpperCase(Locale.ROOT));
+        }
+
+        ToolDefinition definition = mcpClient.resolveDefinition(Intent.LOCATION_CODE, params);
+
+        return (definition != null) ? definition.getToolName() : null;
+    }
+
+    private boolean isRedundantDetailStep(Intent intent, String lastToolResult, List<String> lastCodes) {
+        if (intent == null
+                || lastToolResult == null
+                || lastCodes == null
+                || lastCodes.size() != 1) {
+            return false;
+        }
+
+        String detailTool = resolveDetailToolName();
+        String currentTool = resolveToolName(intent);
+
+        if (detailTool == null || currentTool == null || !detailTool.equals(currentTool)) {
+            return false;
+        }
+
+        try {
+            JsonNode previous = mapper.readTree(lastToolResult);
+            String previousCode = previous.path("general").path("LOC_CD").asText("");
+            if (previousCode.isEmpty()) {
+                previousCode = previous.path("LOC_CD").asText("");
+            }
+
+            return !previousCode.isEmpty() && previousCode.equalsIgnoreCase(lastCodes.get(0));
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private int findAnswerStepIndex(Plan plan) {
+        if (plan == null || plan.steps == null || plan.steps.isEmpty()) {
+            return -1;
+        }
+
+        /* Prefer the last executable step that has a modifier. This includes use_previous_codes steps. */
+        for (int i = plan.steps.size() - 1; i >= 0; i--) {
+            Intent intent = plan.steps.get(i);
+            if (intent == null || resolveToolName(intent) == null) {
+                continue;
+            }
+
+            Map<String, String> params = intent.params == null ? Collections.emptyMap() : intent.params;
+            String modifier = params.get("modifier");
+
+            if (modifier != null && !modifier.trim().isEmpty()) {
+                return i;
+            }
+        }
+
+        /* If no step has a modifier, the last executable step is the answer step. */
+        for (int i = plan.steps.size() - 1; i >= 0; i--) {
+            Intent intent = plan.steps.get(i);
+            if (intent != null && resolveToolName(intent) != null) {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private String getRelation(Intent intent) {
+        if (intent == null) {
+            return "independent";
+        }
+
+        Map<String, String> params = intent.params == null ? Collections.emptyMap() : intent.params;
+        String relation = params.get("relation");
+
+        if (relation == null || relation.trim().isEmpty()) {
+            if ("previous".equalsIgnoreCase(params.get("crossFilterWith"))) {
+                relation = "filter_previous";
+            } else if ("true".equalsIgnoreCase(params.get("enrich"))) {
+                relation = "enrich_previous";
+            } else {
+                relation = "independent";
+            }
+        }
+
+        relation = relation.trim().toLowerCase(Locale.ROOT);
+
+        switch (relation) {
+            case "independent":
+            case "filter_previous":
+            case "enrich_previous":
+            case "use_previous_codes":
+                return relation;
+            default:
+                log.warn("Unknown planner relation '{}'; using independent", relation);
+                return "independent";
+        }
+    }
+
+    private String emptyFilteredResult(String sourceResult) {
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("count", 0);
+        response.put("results", new ArrayList<JsonNode>());
+
+        try {
+            if (sourceResult != null && !sourceResult.trim().isEmpty()) {
+                copyResultMetadata(mapper.readTree(sourceResult), response);
+            }
+            return mapper.writeValueAsString(response);
+        } catch (Exception e) {
+            return "{\"count\":0,\"results\":[]}";
+        }
+    }
+
+    public MCPClientService getMcpClient() {
+        return mcpClient;
+    }
+
+    private boolean isTimeoutResult(String json) {
+        if (json == null) {
+            return false;
+        }
+        try {
+            JsonNode node = mapper.readTree(json);
+            return "QUERY_TIMEOUT".equals(node.path("errorCode").asText());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean isFilteringRelation(String relation) {
+        return "filter_previous".equals(relation) || "use_previous_codes".equals(relation);
+    }
+
+    private String formatMultipleReportChecks(JsonNode node) {
+        JsonNode checks = node.path("checks");
+
+        if (!checks.isObject() || checks.size() == 0) {
+            return "<p>No report checks were returned.</p>";
+        }
+
+        StringBuilder html = new StringBuilder();
+
+        html.append("<h3 class='data-title'>Report Availability</h3>");
+
+        html.append("<p class='answer-summary'>")
+                .append("Checked ")
+                .append(node.path("totalChecked").asInt(0))
+                .append(" location(s) against: ")
+                .append(escapeHtml(
+                        node.path("reportType").asText("")
+                ))
+                .append(".</p>");
+
+        Iterator<Map.Entry<String, JsonNode>> fields = checks.fields();
+
+        while (fields.hasNext()) {
+            Map.Entry<String, JsonNode> entry = fields.next();
+            JsonNode check = entry.getValue();
+            if (!check.isObject()) {
+                continue;
+            }
+            html.append("<section class='report-check-group'>");
+
+            // Ensure older provider responses still have a type.
+            if (!check.has("reportType")
+                    && check instanceof com.fasterxml.jackson.databind.node.ObjectNode) {
+                ((com.fasterxml.jackson.databind.node.ObjectNode) check).put("reportType", entry.getKey());
+            }
+
+            html.append(formatBulkReportCheck(check));
+            html.append("</section>");
+        }
+
+        return html.toString();
+    }
+
 }

@@ -36,117 +36,120 @@
         ], function (Map, MapView, Home, TileLayer, FeatureLayer, GraphicsLayer, Graphic, Polygon) {
 
             const urlParams = new URLSearchParams(window.location.search);
-            const locCd = urlParams.get('locCd');
-
-            const map = new Map();
-            const view = new MapView({
-                container: "viewDiv",
-                map: map
-            });
-
-            const homeBtn = new Home({ view: view });
-            view.ui.add(homeBtn, "top-left");
-
-            // Basemap layer
-            const basemapLayer = new TileLayer({
-                url: "https://domain/arcgis_server/rest/services/AIS_Basemap/MapServer"
-            });
-            map.add(basemapLayer);
-
-            // Asset layer
-            const assetLayer = new FeatureLayer({
-                url: "https://domain/arcgis_server/rest/services/ASSETMap/MapServer/2"
-            });
-            map.add(assetLayer);
-
-            const graphicsLayer = new GraphicsLayer();
-            map.add(graphicsLayer);
-
-            function drawPolygon(rings, extent) {
-                const polygon = new Polygon({
-                    rings: rings,
-                    spatialReference: { wkid: 102140 }
-                });
-
-                const graphic = new Graphic({
-                    geometry: polygon,
-                    symbol: {
-                        type: "simple-fill",
-                        color: [0, 0, 255, 0.5],
-                        outline: {
-                            color: [0, 0, 255, 1],
-                            width: 2
-                        }
-                    }
-                });
-
-                graphicsLayer.add(graphic);
-                view.goTo(polygon);
+            const locCd = (urlParams.get('locCd') || '').trim().toUpperCase();
+			
+            // Dynamically create the status element if it is missing in the HTML body
+            let statusEl = document.getElementById('mapStatus');
+            if (!statusEl) {
+                statusEl = document.createElement('div');
+                statusEl.id = 'mapStatus';
+                statusEl.style.position = 'absolute';
+                statusEl.style.top = '10px';
+                statusEl.style.right = '10px';
+                statusEl.style.background = 'rgba(0,0,0,0.8)';
+                statusEl.style.color = 'white';
+                statusEl.style.padding = '5px 10px';
+                statusEl.style.fontFamily = 'sans-serif';
+                statusEl.style.fontSize = '12px';
+                statusEl.style.borderRadius = '3px';
+                statusEl.style.zIndex = '99';
+                statusEl.style.display = 'block';
+                document.body.appendChild(statusEl);
             }
 			
-            // ── Notify the parent page (the chat window this file is embedded
-            // into via <iframe>) about the query outcome, so it can update the
-            // "View in AIS Asset Search" button that lives outside this iframe
-            // — e.g. relabel it "No feature" and strip its redirect link when
-            // this map couldn't find a matching feature either.
-            //
-            // postMessage is required here (rather than reaching into the
-            // parent DOM directly) because this file and the parent chat page
-            // are two separate documents loaded into an <iframe>; there is no
-            // other supported way for this script to touch the parent's DOM.
-            //
-            // targetOrigin uses window.location.origin, not "*": this assumes
-            // plugin.html and the chat page are always served from the same
-            // origin (same Tomcat webapp), matching how the app is deployed
-            // elsewhere (see AIS_Assistant README: both apps must share a
-            // server for the location-code deep links to work). If you ever
-            // embed this page cross-origin, this postMessage will silently
-            // fail to reach a parent on a different origin — update the
-            // targetOrigin accordingly.
-            function notifyParent(status, locCd) {
+            function setStatus(message, error){
+				statusEl.textContent = message;
+                statusEl.style.display = 'block';
+                statusEl.style.background = error ? 'rgba(139,0,0,0.8)' : 'rgba(0,0,0,0.8)';
+            }
+            
+            function notifyParent(status, locCd, message) {
                 if (window.parent === window) return; // not embedded in an iframe
                 window.parent.postMessage({
                     source: 'ais-plugin-map',
                     status: status,   // 'ok' | 'no-feature' | 'error'
-                    locCd: locCd
+                    locCd: locCd,
+                    message: message || ''
                 }, window.location.origin);
             }
             
-            function queryLayer(locCd) {
-                if (!locCd) return;
+            if (!/^[A-Z]{2}\d{11}$/.test(locCd)) {
+                setStatus(locCd ? 'Invalid location code: ' + locCd : 'No location code was supplied.', true);
+                notifyParent('error', locCd, 'Invalid or missing location code');
+            } else {
+                setStatus('Loading map for ' + locCd + '…', false);
 
-                const whereClause = `LOC_CD = '${locCd}'`;
-                const query = {
-                    where: whereClause,
-                    spatialRelationship: "intersects",
-                    returnGeometry: true,
-                    outFields: ["*"],
-                    outSpatialReference: { wkid: 102140 }
-                };
+                const map = new Map();
+                const view = new MapView({ container: 'viewDiv', map: map });
+                view.ui.add(new Home({ view: view }), 'top-left');
 
-                assetLayer.queryFeatures(query)
-                    .then(function (results) {
-                        if (results.features.length > 0) {
-                            const feature = results.features[0];
-                            drawPolygon(feature.geometry.rings, feature.geometry.extent);
-                        	notifyParent('ok', locCd);
-                        } else {
-                            console.warn("No feature found for LOC_CD:", locCd);
-                            notifyParent("no-feature", locCd);
-                        }
-                    })
-                    .catch(function (error) {
-                        console.error("Error querying layer:", error);
-                        notifyParent("error", locCd);
-                    });
-            }
-
-            // Auto-query if locCd is passed in URL
-            if (locCd) {
-                // Wait for layers to load before querying
-                view.whenLayerView(assetLayer).then(() => {
-                	queryLayer(locCd);
+                const basemapLayer = new TileLayer({
+                    url: 'https://domain/arcgis_server/rest/services/AIS_Basemap/MapServer'
                 });
+                map.add(basemapLayer);
+
+                const assetLayer = new FeatureLayer({
+                    url: 'https://domain/arcgis_server/rest/services/ASSETMap/MapServer/2',
+                    outFields: ['*']
+                });
+                map.add(assetLayer);
+
+                const graphicsLayer = new GraphicsLayer();
+                map.add(graphicsLayer);
+
+                basemapLayer.load().catch(function(error) {
+                    console.warn('Basemap unavailable:', error);
+                });
+
+                function symbolFor(geom) {
+                    if (!geom) return null;
+                    if (geom.type === 'point' || geom.type === 'multipoint') {
+                        return { type: 'simple-marker', color: [0,0,255,.8], size: 10, outline: { color: [255,255,255,1], width: 1 } };
+                    }
+                    if (geom.type === 'polyline') {
+                        return { type: 'simple-line', color: [0,0,255,1], width: 3 };
+                    }
+                    return { type: 'simple-fill', color: [0,0,255,.35], outline: { color: [0,0,255,1], width: 2 } };
+                }
+
+                function showFeature(feature) {
+                    const graphic = new Graphic({ geometry: feature.geometry, attributes: feature.attributes, symbol: symbolFor(feature.geometry) });
+                    graphicsLayer.removeAll();
+                    graphicsLayer.add(graphic);
+                    return view.goTo(graphic.geometry.extent ? graphic.geometry.extent.expand(1.5) : graphic.geometry);
+                }
+
+                function queryLocation() {
+                    const query = assetLayer.createQuery();
+                    query.where = "LOC_CD = '" + locCd.replace(/'/g, "''") + "'";
+                    query.returnGeometry = true;
+                    query.outFields = ['*'];
+                    query.outSpatialReference = { wkid: 102140 };
+
+                    return assetLayer.queryFeatures(query).then(function(results) {
+                        if (!results.features || results.features.length === 0) {
+                            const message = 'No map feature was found for ' + locCd + '.';
+                            setStatus(message, true);
+                            notifyParent('no-feature', locCd, message);
+                            return;
+                        }
+                        return showFeature(results.features[0]).then(function() {
+                            setStatus('Showing location ' + locCd + '.', false);
+                            notifyParent('ok', locCd, '');
+                            window.setTimeout(function() { statusEl.style.display = 'none'; }, 2500);
+                        });
+                    });
+                }
+
+                // Catch layer-load failures as well as query failures.
+                assetLayer.load()
+                    .then(queryLocation)
+                    .catch(function(error) {
+                        console.error('Asset map unavailable:', error);
+                        const message = 'Map service is unavailable for ' + locCd + '. The location code was received correctly.';
+                        setStatus(message, true);
+                        notifyParent('error', locCd, message);
+                    });
             }
         });
     </script>

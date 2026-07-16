@@ -8,10 +8,11 @@ For project overview, tech stack, and high-level architecture, see **[README.md]
 
 - [Developer guide](#developer-guide)
   - [System Workflow & File Lifecycle Architecture](#system-workflow--file-lifecycle-architecture)
-  - [Regex Template Gateway (Zero-LLM Fast Path)](#regex-template-gateway-zero-llm-fast-path)
+  - [Structured keyword extraction and catalog routing](#structured-keyword-extraction-and-catalog-routing)
   - [LLM provider routing](#llm-provider-routing)
   - [Registered tools](#registered-tools)
   - [Dynamic quick prompt buttons / `/skill` tools list](#dynamic-quick-prompt-buttons--skill-tools-list)
+  - [Authentication and endpoint RBAC](#authentication-and-endpoint-rbac)
   - [Configuration & environment](#configuration--environment)
   - [Build and run](#build-and-run)
   - [Production deployment](#production-deployment)
@@ -37,12 +38,43 @@ For project overview, tech stack, and high-level architecture, see **[README.md]
 
 ## Developer guide
 
+## July 2026 implementation update
+
+### Canonical composition and performance
+
+`QueryPlanner` and `PlanOptimizer` now preserve a valid canonical filtering prefix when an LLM adds a non-filtering singular detail projection. Compatible steps collapse to one catalog-resolved `location_query`; ordinary tools are still resolved from metadata rather than an orchestration switch. A live `PSM/CENTRAL + grade=ALL + BSI,KAI` run returned eight locations with one tool call and no retry. The database query completed in approximately 306 ms; keyword extraction and verification remained the dominant latency.
+
+The GIS grade and monument predicates use correlated `EXISTS` checks rather than grouping the complete GIS table for each composed query. Production still requires indexes on PSM/LOC_CD, report LOC_CD columns, and GIS LOC_CD/heritage columns.
+
+### Timeout and fallback semantics
+
+JDBC query timeout values are seconds and are configured separately from Hikari connection-acquisition timeouts (milliseconds). A timeout returns a structured `QUERY_TIMEOUT` tool error and must never be converted to an ordinary empty result. The same generated-SQL strategy runs at most once per request. A successful query with zero rows remains a valid answer.
+
+`check_reports` exposes matching rows through top-level `results` while retaining `withReport`, `withoutReport`, and grouped `checks`. Relation chaining consumes `results` only, so locations without the first report do not leak into the next report check.
+
+### Verification graph accounting
+
+`GraphState` tracks full regenerations and targeted repairs separately. `VerifierRouter` prefers one bounded catalog repair when concrete `REINVOKE_TOOL` feedback exists; `PatchRouter` returns a successful repair to the verifier. Infrastructure failures are terminal/bounded rather than repeatedly regenerated. API output exposes `regenerations` and `repairAttempts`; `verified=true` means the final verifier result is `APPROVED`, not merely that formatting succeeded.
+
+### Grouped reports and maps
+
+`OllamaService.formatAsHtml()` recognizes grouped `checks` before generic object formatting and renders each registered report response through the shared bulk-report formatter. Report URLs are stored with raw query delimiters and escaped once at the HTML boundary.
+
+Multi-location details use one sticky map wrapper with location-code tabs. `plugin.html` validates and displays `locCd`, supports point/polyline/polygon geometry, catches both layer-load and query failures, and notifies the parent page with `ok`, `no-feature`, or `error`. The parent replaces unavailable iframes with a code-specific message.
+
+Current infrastructure finding: `domain` resolves internally; HTTP port 80 is reachable but ArcGIS returns `401`, while HTTPS port 443 is unavailable. Use approved Windows/integrated authentication and credentialed CORS, or preferably a constrained same-origin reverse proxy. Never embed usernames, passwords, or long-lived ArcGIS tokens in `plugin.html`/`chat.js`.
+
+### Deployment security warning
+
+Security has been enabled by default (`security.enabled=true`) and fully validated. Endpoint RBAC tests for anonymous (`401`), ordinary user (`200` / allowed), user schema (`403` / forbidden), and admin schema access (`200` / allowed) have been successfully run and verified.
+
+
 ### System Workflow & File Lifecycle Architecture
 
 ```
                  ┌─────────────────────────────────────────────────────────┐
                  │                  BROWSER / CLIENT UI                    │
-                 │   index.jsp (Chat UI, Quick Prompts) | chat.jsp (Core)  │
+                 │          index.jsp (Chat UI, Quick Prompts)             │
                  └────────────────────────────┬────────────────────────────┘
                                               │  POST /api/chat { prompt }
                                               ▼
@@ -79,9 +111,9 @@ For project overview, tech stack, and high-level architecture, see **[README.md]
 │  [Phase 0: Memory]  ──► resolveReferentialPrompt() (Excludes verifier feedback)             │
 │  [Phase 1: Extract] ──► OllamaService.extractKeywords() → ExtractedKeywords.java            │
 │  [Phase 2: Plan]    ──► QueryPlanner.analyse() → Plan.java / IntentStep.java (LLM plan)                │
-│  [Phase 3: FastPath]──► OllamaService.executePlan() → MCPClientService (ToolDef)                  │
+│  [Phase 3: FastPath]──► OllamaService.executePlan() → ToolDispatcher / location_query              │
 │  [Phase 4: SQL Gen] ──► generateAndExecuteSql() → DatabaseManager.java (Dynamic Table)      │
-│  [Phase 5: Agent]   ──► runAgentLoop() → MCPTool.java / OllamaRequest.java                  │
+│  [Phase 5: Agent]   ──► runAgentLoop() (Dynamic tool-call schema maps)                      │
 │  [Phase 6: Fallback]──► isUselessSqlResult() fallback → ExecutionResult / AgentResult       │
 └─────────────────────────────────────────────┬───────────────────────────────────────────────┘
                                               │ Communicates via TCP / JDBC
@@ -93,6 +125,8 @@ For project overview, tech stack, and high-level architecture, see **[README.md]
    │  Used when API key set   │ │  Used when no API key    │ │                          │
    └──────────────────────────┘ └──────────────────────────┘ └──────────────────────────┘
 ```
+
+> **Security ingress:** Before any controller shown above executes, `AuthenticationFilter` intercepts `/api/*` and `/report/*`. It returns `401` when Tomcat cannot establish a trusted principal and `403` when the principal lacks the route role. Only an authorized request reaches `ChatServlet`, the graph, LLM, tools, or database.
 
 ---
 
@@ -106,51 +140,60 @@ Every file in the project structure serves a precise role in ensuring lightning-
 * `src/main/java/com/ais/config/AppConfig.java`: Centralized configuration resolver and single source of truth. Employs a 3-tier fallback hierarchy: environment variables (`APP_CONFIG_PATH` / `-Dapp.config`) → classpath properties → hardcoded defaults. Exposes `useTencentCloud()`, `getTencentApiKey()`, `getTencentBaseUrl()`, `getTencentModel()`, and `verifierModel()` (supporting model overrides across both Tencent Cloud and Ollama modes).
 
 #### 2. Presentation Layer (`src/main/webapp/`)
-* `WEB-INF/web.xml`: Deployment descriptor for Apache Tomcat 9. Binds URL patterns (`/api/chat`, `/api/tools`, `/api/location/*`, `/report/view`) to their respective servlets.
+* `WEB-INF/web.xml`: Deployment descriptor for Apache Tomcat 9. Registers `AuthenticationFilter` for `/api/*` and `/report/*`, declares `AIS_USER`/`AIS_ADMIN`, configures the local BASIC login mechanism, and binds URL patterns (`/api/chat`, `/api/tools`, `/api/location/*`, `/report/view`) to their respective servlets.
 * `jsp/index.jsp`: The primary single-page application frontend (HTML + CSS only, plus one tiny inline bootstrap `<script>`). Declares `isELIgnored="true"` so JS template literals like `${...}` inside `js/chat.js`-style code are never misread as JSP Expression Language. Exposes the deployment context path as `window.APP_CONTEXT_PATH` (via `<%= request.getContextPath() %>`) for the external script to read, since plain `.js` files are served statically and never see JSP scriptlets. Contains the `.ais-detail-btn`, `.location-map-sticky`, `.message-row`, and `#quick-prompts` CSS used by location code links, the sticky map layout, and the `/skill` tools list.
 * `jsp/js/chat.js`: All chat UI logic, extracted from `index.jsp` for a smaller JSP and normal JS tooling/linting support. Handles sending messages, rendering tool-call accordions, the `/skill` tools list (ranking, rendering, `↑`/`↓` navigation, `Tab`/`Enter`/click-to-apply), and `extractMapBlock()` — which detaches the server-rendered `.location-map-block` from a location detail message and re-parents it as a true DOM sibling (`.location-map-sticky`) instead of leaving it nested inside the message bubble. Must be served from `src/main/webapp/js/chat.js` (see [Known issues & fixes](#known-issues--fixes) for the WAR-packaging rule that applies to any static asset under `src/main/webapp/`).
-* `jsp/chat.jsp`: Dedicated presentation views and modular UI components for chat rendering.
 
 #### 3. Controller Layer (`src/main/java/com/ais/controller/`)
-* `ChatServlet.java`: The primary API ingress (`POST /api/chat`). Delegates property resolution entirely to `AppConfig.java` during initialization (ensuring external Linux configuration overrides like `APP_CONFIG_PATH` are respected across the app). Initializes the LangGraph state machine, constructs `GraphState`, orchestrates the execution graph, and returns structured execution metrics (time elapsed, retries, tool calls) in JSON. Supports direct pass-through when `graph.verification.enabled=false`.
+* `ChatServlet.java`: The primary API ingress (`POST /api/chat`). It executes only after `AuthenticationFilter` establishes an authenticated `AuthorizationContext`. Delegates property resolution entirely to `AppConfig.java` during initialization (ensuring external Linux configuration overrides like `APP_CONFIG_PATH` are respected across the app). Initializes the LangGraph state machine, constructs `GraphState`, orchestrates the execution graph, and returns structured execution metrics (time elapsed, retries, tool calls) in JSON. Sanitizes the final LLM-generated HTML answer with an OWASP Java HTML Sanitizer allowlist immediately before JSON serialization, returns safe JSON error objects, disables wildcard CORS, and sets no-store/nosniff response headers. Supports direct pass-through when `graph.verification.enabled=false`.
 * `ToolsServlet.java`: Serves `GET /api/tools`. Exposes dynamic UI metadata generated by `MCPClientService` to auto-render Quick Prompt buttons in `index.jsp`.
-* `LocationServlet.java`: Handles direct location lookups (`/api/location/general-info`) and live database schema introspection (`/api/location/schema`).
+* `LocationServlet.java`: Handles direct location lookups (`/api/location/general-info`) and database schema introspection (`/api/location/schema`). Both GET and POST schema branches require `AIS_ADMIN` before calling `DatabaseManager.introspectSchema()`, in addition to the global authentication filter.
 * `ReportServlet.java`: Serves `/report/view`. Handles direct rendering and linking for specialized asset reports (`BSI`, `CSR`, `KAI`, `EMMS`, `DSSR`, and `Slope`).
+
+#### Security Layer (`src/main/java/com/ais/security/`)
+* `AuthenticationFilter.java`: Fail-closed servlet filter mapped to `/api/*` and `/report/*`. Calls the Tomcat/container authentication mechanism, returns `401` for missing/invalid identity and `403` for insufficient role, applies `AIS_ADMIN` to `/api/location/schema`, and sets baseline security headers.
+* `AuthorizationContext.java`: Immutable request-scoped identity/role object derived only from the trusted container principal. Its department allowlist starts empty and must never be interpreted as unrestricted data access.
+* `SecurityGuards.java`: Defense-in-depth helper used at the start of the schema handler so a future filter-mapping regression cannot expose schema introspection.
 
 #### 4. LangGraph Verification Layer (`src/main/java/com/ais/graph/`)
 * `AgentGraph.java`: The core state machine engine. Compiles the node/edge execution graph and maintains the `invoke()` loop across all verifications.
-* `GraphState.java`: The shared blackboard state object passed between nodes. Contains the user query, session ID, detected intent, tool outputs, retry counters, and final HTML response.
+* `GraphState.java`: The shared blackboard state object passed between nodes. Contains the user query, session ID, detected intent, tool outputs, retry counters, structured `VerifierFeedback`, targeted-repair status, and final HTML response.
+* `VerifierFeedback.java`: Bounded verifier output model containing the suggested action, missing catalog tool names, suggested arguments, reason, and confidence. Its tool suggestions are untrusted until `PatchNode` validates them.
 * `GraphNode.java`: Interface defining the contract for all state machine nodes.
 * `GraphEdge.java`: Functional interface defining conditional routing logic between nodes.
 * `VerificationGraphFactory.java`: The wiring harness executed during servlet init. Reads `graph.verification.enabled`, `ollama.baseUrl`, `ollama.model`, and `verifier.model` from `application.properties`. Connects all nodes into the 5-step lifecycle (`planner` → `primary_llm` → `verifier` → `formatter` / `fallback`). When verification is disabled, the verifier node is skipped and `primary_llm` routes directly to `formatter`.
-* `VerificationGraphFactory$VerifierRouter.class`: The conditional router that inspects `VerifierNode` results. Directs flow to `formatter` on `APPROVED`, loops back to `primary_llm` on `RETRY`, or forces a best-effort render after exhausting `MAX_RETRIES` (3).
+* `VerificationGraphFactory$VerifierRouter.class`: The conditional router that inspects `VerifierNode` results. Directs flow to `formatter` on `APPROVED`, routes concrete `REINVOKE_TOOL` feedback to `PatchNode`, routes ordinary `RETRY` feedback to `primary_llm`, and forces a best-effort render after the separate regeneration/repair budgets are exhausted. `PatchRouter` sends successful repairs back through verification.
 
 #### 5. Graph Node Implementations (`src/main/java/com/ais/graph/nodes/`)
 * `PlannerNode.java` *(Step 1)*: Ingress node. Scans raw query text to detect preliminary operational intents and stores them in `GraphState`.
 * `PrimaryLlmNode.java` *(Step 2 / Retry Loops)*: The primary action node. Invokes `OllamaService.invoke(...)` to execute keyword extraction, fast-path tool execution, or dynamic SQL generation. Stores the initial HTML response in `state.primaryResponse`.
-* `VerifierNode.java` *(Step 3)*: The zero-trust validation node. Delegates verification to `OllamaService.callLlmSimple()` which routes to Tencent Cloud or Ollama based on config. The model used is `verifier.model` (or `ollama.model` as fallback) read from `application.properties`. Features a fail-open design (auto-approves if the LLM service is unreachable or `graph.verification.enabled=false`) and short-circuits known failure patterns to `RETRY`. Does **not** manage its own HTTP client — all routing is handled by `OllamaService`.
+* `VerifierNode.java` *(Step 3)*: The zero-trust validation node. Delegates verification to `OllamaService.callLlmSimple()` which routes to Tencent Cloud or Ollama based on config. The model used is `verifier.model` (or `ollama.model` as fallback) read from `application.properties`. It emits structured `VerifierFeedback` for concrete missing-tool repairs, fail-opens if the LLM service is unreachable, and short-circuits only empty/technical failure summaries to `RETRY`; a successful zero-row database result remains a valid answer. Does **not** manage its own HTTP client — all routing is handled by `OllamaService`.
+* `PatchNode.java` *(targeted recovery)*: Validates verifier-suggested tool names and arguments through the catalog/dispatcher, executes only the configured bounded repair calls, appends dynamically formatted, collapsible HTML details and native tables (instead of raw JSON dumps) of the repair output to the primary response, and routes successful repairs back to `VerifierNode`.
 * `FormatterNode.java` *(Step 4)*: The success handler. Receives `APPROVED`, `null` (verification disabled), or best-effort retry results, applies final HTML table stylings, and marks `success=true`.
 * `FallbackNode.java` *(Step 5)*: The failsafe handler. Replaces broken or completely unresolvable executions with a safe, standardized error message (`success=false`).
 
 #### 6. Service Layer (`src/main/java/com/ais/service/`)
-* `OllamaService.java`: The central orchestration hub. Hosts the 7-Phase execution pipeline. Manages referential session memory, LLM provider routing, keyword extraction, SQL generation, agent loop, and HTML formatting. Exposes `callLlmSimple(prompt, temperature, maxTokens)` as the unified LLM gateway used by both `PrimaryLlmNode` and `VerifierNode`. Routes all calls to Tencent Cloud when `tencent.api.key` is set, otherwise falls back to Ollama. Houses the **Regex Template Gateway** for zero-LLM fast paths. Its `executePlan()` method applies generic relations (`filter_previous`, `enrich_previous`, `use_previous_codes`) from the LLM plan, and falls back to SQL generation when the tool result is empty. Also includes: `sanitizeGrade()` for grade input normalization (including the `GRADED` sentinel), `validateLlmSql()` for post-generation SQL hallucination correction, `runPostStepChains()` for extensible post-tool-call actions, `enrichWithHistoricGrade()` for monument-to-grade merging, `filterResultsByLocation()` for prompt-based result filtering, and `findByYear()` for OLDEST/NEWEST modifier resolution.
-* `OllamaService$AgentResult.class`: Encapsulates the final output, execution path, and metadata returned to `PrimaryLlmNode`. `addToolCall(name, args, result)` must be called **exactly once** per real tool invocation — see [Known issues & fixes](#known-issues--fixes) for a bug where the agent loop called it twice per tool call, making every response look like it had duplicate tool calls even when only one real DB/tool round-trip occurred.
-* `OllamaService$AgentResult$ToolCallRecord.class`: Audit record tracking exact tool name, JSON arguments, and raw output for one tool invocation. `PrimaryLlmNode` copies the full list of these records into `GraphState.toolCallDetails` (see [GraphState fields](#graphstate-fields)) so the UI's tool-call accordion can render each call's own individual args/result instead of a shared/flattened summary.
-* `QueryPlanner.java`: The planning gateway. First, it converts any LLM-generated `plan` array into internal `Intent` steps (sorted by priority, with generic relations preserved). If no plan is returned, it falls back to a deterministic rule engine that pre-validates parameters, handles compound patterns (HISTORIC+PSM, MONUMENT+HISTORIC, etc.), and splits multi-report requests into chained execution steps. Fast-path tools use `needsLlm=false`; missing parameters route to the LLM agent or SQL generator (`needsLlm=true`).
+* `OllamaService.java`: The central orchestration hub. Hosts the 7-phase execution pipeline, referential session memory, LLM provider routing, keyword extraction, SQL generation, agent loop, and HTML formatting. Its `executePlan()` consumes catalog-validated `Intent` steps and applies the generic relations `filter_previous`, `enrich_previous`, and `use_previous_codes`; it does not contain a case for each tool. Detail-tool resolution, argument conversion, code extraction, intersection, and enrichment are driven by standardized result contracts and `ToolDefinition` metadata. It also contains `findByYear()` for the domain-specific OLDEST/NEWEST comparison and the `AgentResult` audit wrapper.
+* `OllamaService$AgentResult.class`: Encapsulates the final output and per-call metadata returned to `PrimaryLlmNode`. `addToolCall(name, args, result)` is recorded exactly once per real tool invocation.
+* `OllamaService$AgentResult$ToolCallRecord.class`: Audit record tracking the exact tool name, JSON arguments, and raw output for one invocation. `PrimaryLlmNode` copies these records into `GraphState.toolCallDetails`.
+* `QueryPlanner.java`: The planning gateway. It sorts LLM plan steps by priority, normalizes relations, resolves types and aliases through `MCPClientService`, validates supported relations and consumed fields, permits previous-code inputs for `use_previous_codes`, and preserves explicit modifiers on their intended step. Invalid first-step filtering/enrichment relations and unsupported plans are rejected.
 * `Plan.java`: Data model representing the execution path decided by `QueryPlanner`.
-* `Intent.java` & `IntentRole.java`: Enum and mapping definitions for operational intents.
-* `PipelineExecutor.java`: Helper for executing deterministic multi-step tool plans. Currently imported by `OllamaService` for future use; plan execution is handled directly in `OllamaService.executePlan()`.
-* `MCPClientService.java`: The tool dispatch registry. Binds tool intents to actual database queries and returns metadata for UI buttons.
-* `LocationService.java`: Business logic abstraction wrapping location details and historical code shifts.
-* `ReportTypeRegistry.java`: Centralized registry defining valid report types, their full display names, and target SQL tables.
+* `Intent.java` & `IntentRole.java`: Lightweight execution models. Catalog intent types may be represented as strings; built-in constants remain for compatibility and display roles.
+* `PipelineExecutor.java`: Helper for executing deterministic multi-step tool plans. Currently imported by `OllamaService` for compatibility; the active plan execution path is `OllamaService.executePlan()`.
+* `MCPClientService.java`: Compatibility facade over the catalog and dispatcher. Existing callers use `listTools()`, `listToolsForUI()`, `resolveDefinition()`, `getAcceptedParameters()`, and `callTool()` without knowing where tools are registered.
+* `ToolRegistryFactory.java`: Builds the in-process `ToolCatalog`. It currently contains the existing anonymous database-backed executors and registration helpers; these may later be split into domain-specific provider classes.
+* `ToolCatalog.java`: Stores `ToolRegistration` objects, resolves intent types/aliases, exposes accepted parameters, and produces function-calling schemas.
+* `ToolDispatcher.java`: Validates arguments and invokes the selected `ToolProvider`; it does not register tools or contain planner logic.
+* `ToolRegistration.java`: Combines `ToolDefinition`, description, JSON properties, UI metadata, and a `ToolProvider` executor.
+* `ToolDefinition.java`: Declarative metadata for a tool: name, intent types, aliases, required parameters, supported relations, produced fields, consumed fields, and planner enablement.
+* `ToolProvider.java`: Provider abstraction used by the catalog. A provider exposes its `ToolDefinition` and executes a validated argument map.
+* `ReportTypeRegistry.java`: Centralized registry defining valid report types, display names, aliases, availability table names, trusted identifier columns, Java 8-compatible report normalization, and the virtual `ALL` aggregate. Availability types are `BSI`, `CSR`, `KAI`, `EMMS`, and `DSSR`; slope-only display types do not expose availability-table metadata.
+* `QueryDimensionRegistry.java`: Database-dimension registry used by the composed `location_query` path. It maps canonical parameters to trusted `QueryPredicate` builders and is independent of tool names.
 
 #### 7. Data Model Layer (`src/main/java/com/ais/model/`)
 * `ExtractedKeywords.java`: Strongly typed POJO representing the JSON output of the keyword extraction phase. Includes `intents`, `primaryIntent`, `showDetails`, and the ordered `plan` array.
 * `IntentStep.java`: One entry in the LLM-generated `plan` array. Contains `type`, `priority`, `params`, and `relation` (`independent`, `filter_previous`, `enrich_previous`, `use_previous_codes`).
-* `ChatMessage.java`: Represents individual chat turns within the HTTP session.
-* `OllamaRequest.java`: Serialization model for constructing outbound JSON prompts to Ollama.
 * `OpenAiRequest.java`: Serialization model for constructing outbound JSON prompts to Tencent Cloud (OpenAI-compatible format). Contains inner `Message` class with `role` and `content` fields.
-* `MCPTool.java`: Represents available tool function schemas passed to the LLM during agent loop reasoning.
 * `ExecutionResult.java` & `LocationResult.java`: Modular wrappers for handling generic tool execution statuses and database query payloads.
 
 #### 8. Database Layer (`src/main/java/com/ais/db/`)
@@ -167,6 +210,7 @@ Every file in the project structure serves a precise role in ensuring lightning-
 * `lombok-1.18.32.jar`: Compile-time annotation processor.
 * `java-dotenv-5.2.2.jar`: Loads environment variables from `.env` files.
 * `byte-buddy-1.14.9.jar` / `annotations-13.0.jar`: Runtime bytecode generation and nullability annotations.
+* `owasp-java-html-sanitizer`: Java 8-compatible HTML allowlist sanitizer used by `ChatServlet` to remove unsafe LLM-generated markup before it reaches the browser.
 
 #### 10. Build & Target Artifacts (`target/`)
 * `ais_ai.war`: The fully assembled, production-ready Web Archive.
@@ -176,77 +220,15 @@ Every file in the project structure serves a precise role in ensuring lightning-
 
 ---
 
-### Regex Template Gateway (Zero-LLM Fast Path)
+### Structured keyword extraction and catalog routing
 
-To achieve 0ms zero-LLM fast-path execution on standard UI button clicks, `OllamaService` utilizes a Regex Template Gateway. If an incoming prompt matches an exact button click template, it manually builds the `ExtractedKeywords` object in Java and returns it instantly, completely bypassing the LLM extraction phase.
+The current request path uses structured keyword extraction and catalog metadata rather than a growing list of semantic prompt-regex templates. `OllamaService.extractKeywords()` uses the keyword cache when appropriate and otherwise asks the configured LLM for an `ExtractedKeywords` JSON object containing canonical fields, an ordered plan, and generic relations.
 
-```java
-// Inside OllamaService.java
+The catalog remains the source of truth for tool names, accepted parameters, supported relations, produced fields, and UI metadata. `QueryPlanner` validates the plan, `PlanOptimizer` merges compatible canonical dimensions into `location_query`, and `ToolDispatcher` validates the final invocation.
 
-private ExtractedKeywords matchExactTemplatePrompt(String prompt) {
-    if (prompt == null) return null;
-    String clean = prompt.trim();
+Security and structural validation are separate concerns. Prompt-injection filtering, location-code recognition, SQL safety checks, and row-limit clamping may use bounded patterns, but new business tools must not be selected by adding another prompt regex or another orchestrator switch.
 
-    // Template 1: "Get info for [LOC_CD]"
-    Matcher mInfo = Pattern.compile("(?i)^Get info for ([A-Z0-9]{11,15})$").matcher(clean);
-    if (mInfo.matches()) {
-        ExtractedKeywords kw = new ExtractedKeywords();
-        kw.setIntents(Collections.singletonList("LOCATION_CODE"));
-        kw.setLocationCode(mInfo.group(1).toUpperCase());
-        log.info("🎯 Exact Template Match: Get info for {}", kw.getLocationCode());
-        return kw;
-    }
-
-    // ... additional templates ...
-
-    return null; // No exact match -> Fall back to LLM Extraction
-}
-```
-
-#### Registered templates
-
-| Template pattern | Regex | Resulting intent |
-|---|---|---|
-| `Get info for [LOC_CD]` | `(?i)^Get info for ([A-Z0-9]{11,15})$` | `LOCATION_CODE` with `locationCode` |
-| `Show locations for department [DEPT]` | `(?i)^Show locations for department ([A-Z]{2,6})$` | `DEPARTMENT` with `department` |
-| `Show locations under PSM [NAME]` | `(?i)^Show locations under PSM/?([A-Z0-9 .&()_-]+)$` | `PSM` with `psm` |
-| `List all PSMs` / `show PSMs` | Case-insensitive exact match | `PSM` (list all) |
-| `Search location code history for [LOC_CD]` | `(?i)^Search location code history for ([A-Z0-9]{11,15})$` | `CODE_HISTORY` with `locationCode` |
-
-Any prompt that does not match these templates falls through to the keyword cache, then to LLM extraction.
-
-The primary `extractKeywords` method checks this gateway prior to testing the keyword cache or invoking the LLM:
-
-```java
-public ExtractedKeywords extractKeywords(String userPrompt) {
-    boolean isRetry = userPrompt.contains("[Previous answer was flagged");
-    String cacheKey = userPrompt.trim().toLowerCase();
-
-    if (!isRetry) {
-        // ── 1. CHECK REGEX TEMPLATE GATEWAY (0ms Fast Path) ──
-        ExtractedKeywords templateMatch = matchExactTemplatePrompt(userPrompt);
-        if (templateMatch != null) {
-            return templateMatch;
-        }
-
-        // ── 2. CHECK KEYWORD CACHE ──
-        ExtractedKeywords cached = kwCache.get(cacheKey);
-        if (cached != null) {
-            log.info("⚡ Keyword cache hit");
-            return cached;
-        }
-    }
-
-    // ── 3. FALL BACK TO LLM EXTRACTION (Tencent or Ollama) ──
-    ExtractedKeywords result = extractKeywordsFromLlm(userPrompt);
-    if (result != null && !isRetry) {
-        kwCache.put(cacheKey, result);
-    }
-    return result;
-}
-```
-
----
+For Java 8 compatibility, registry and query code uses ordinary loops and `Collections.unmodifiableList(...)`; it must not use `String.isBlank()`, `List.copyOf(...)`, `Map.of(...)`, `Stream.toList()`, or `Collectors.toUnmodifiableList()`.
 
 ### LLM provider routing
 
@@ -281,20 +263,107 @@ All three call sites use the same unified method:
 
 ### Registered tools
 
-All search tools now accept an optional `location` parameter for DB-side filtering. The 5 list-returning tools (`search_by_name`, `locations_by_psm`, `locations_by_dept`, `search_declared_monument`, `search_historic_building`) additionally accept optional `limit` (integer — caps the row count, clamped server-side to a max of 500) and `excludeUndefinedField` (string enum: `address` / `name` / `department` — excludes rows where that field is `NULL`, blank, `-`, or contains the literal text `UNDEFINED`) parameters. See [New capabilities](#new-capabilities) for how these are detected from free-text prompts (`"top 50"`, `"with address not undefined"`) as well as settable directly by the LLM.
+Tools are registered in `ToolRegistryFactory.registerTools()` and exposed through the shared catalog. The same metadata is used for:
+
+```text
+agent tools/list → QueryPlanner → buildArgs() → callTool() → UI /api/tools
+```
+
+A registration contains:
+
+| Metadata | Purpose |
+|---|---|
+| `toolName` | Runtime function name and unique registry key |
+| `intentTypes` / `aliases` | Planner resolution and LLM plan type matching |
+| `requiredParameters` | Planner and runtime validation |
+| `supportedRelations` | Allowed `independent`, `filter_previous`, `enrich_previous`, or `use_previous_codes` relations |
+| `producedFields` | Fields made available to later steps |
+| `consumedFields` | Fields required from a previous step; `use_previous_codes` tools must declare `LOC_CD` |
+| JSON properties | Function-calling schema sent to the LLM |
+| UI metadata | `/api/tools` and `/skill` prompt generation |
+| executor | Deterministic Java/database implementation |
+
+Tools that consume previous location codes must accept either `locCds` or `locCd`, declare `LOC_CD` in `consumedFields`, and return a standard code-bearing result where possible. List tools should return:
+
+```json
+{
+  "count": 2,
+  "results": [
+    {
+      "LOC_CD": "AA12345678901",
+      "LOC_NAME": "Example Location"
+    }
+  ]
+}
+```
+
+This lets `OllamaService` perform generic code extraction, filtering, enrichment, session memory, and rendering without adding a new execution branch.
+
+#### Current registered tools
+
+All applicable search tools accept an optional `location` parameter for database-side filtering. The five list-returning tools additionally accept `limit` and `excludeUndefinedField`. `check_reports` accepts one registered availability type, a comma-separated list, or the virtual `ALL` aggregate; the database expands these through `ReportTypeRegistry`. Compatible multi-filter plans use the `location_query` registration and the database-side `QueryDimensionRegistry`; they do not require a separate hardcoded tool-combination branch.
 
 | Tool | Args | Description |
 |---|---|---|
 | `hardcode_query` | `locCd` | Full details + reports for one location code |
-| `search_by_name` | `locName`, `location?`, `limit?`, `excludeUndefinedField?` | Partial match by name, optional district filter |
-| `check_reports` | `reportType`, `locCds[]` | Bulk availability check across locations, rendered as sortable HTML tables (`<table class='data-table'>`) for UI widgets |
-| `list_psms` | *(none)* | All distinct PSMs with counts |
-| `locations_by_psm` | `psm`, `location?`, `limit?`, `excludeUndefinedField?` | Locations under a specific PSM |
-| `locations_by_dept` | `deptCd`, `location?`, `limit?`, `excludeUndefinedField?` | Locations owned/managed by a department, with optional district/area scoping |
-| `search_declared_monument` | `filter`, `location?`, `limit?`, `excludeUndefinedField?` | Declared monument lookup (T/F/ALL) |
-| `search_historic_building` | `grade`, `location?`, `limit?`, `excludeUndefinedField?` | Historic building lookup by grade |
-| `search_loc_cd_history` | `formerLocCd`, `currentLocCd` | Location code history lookup |
-| `show_schema` | *(none)* | Database schema introspection |
+| `search_by_name` | `locName`, `location?`, `limit?`, `excludeUndefinedField?` | Partial match by name |
+| `check_reports` | `reportType`, `locCds[]` | Bulk report availability |
+| `list_psms` | *(none)* | Distinct PSMs with counts |
+| `locations_by_psm` | `psm`, `location?`, `limit?`, `excludeUndefinedField?` | Locations under a PSM |
+| `locations_by_dept` | `deptCd`, `location?`, `limit?`, `excludeUndefinedField?` | Locations managed by a department |
+| `search_declared_monument` | `filter`, `location?`, `limit?`, `excludeUndefinedField?` | Declared monument lookup |
+| `search_historic_building` | `grade`, `location?`, `limit?`, `excludeUndefinedField?` | Historic building lookup |
+| `search_loc_cd_history` | `formerLocCd`, `currentLocCd` | Location-code history lookup |
+| `location_query` | `locName?`, `location?`, `psm?`, `deptCd?`, `grade?`, `filter?`, `reportType?`, `locCd?`, `locCds?`, `limit?`, `excludeUndefinedField?` | Composed database-side location query |
+
+#### Composed location-query path
+
+`location_query` is the generic database-backed composition path. The flow is:
+
+```text
+PlanOptimizer
+    → canonical parameter map
+    → ToolDispatcher.callTool("location_query", args)
+    → DatabaseManager.executeLocationQuery(Map)
+    → QueryDimensionRegistry
+    → QueryPredicate list
+    → LocationQuery SQL builder
+```
+
+The registry currently maps canonical database dimensions such as `locName`, `location`, `psm`, `deptCd`, `grade`, `filter`, `locCd`, `locCds`, and report requirements. `ReportTypeRegistry.normalizeReportTypes(...)` expands `ALL` and comma-separated report values through registered availability metadata. `reportType` is the canonical report filter key; `requiredReports` may remain as a compatibility alias at the database-dimension boundary. Report table and identifier-column lookup comes from `ReportTypeRegistry`, not from a tool switch or `ReportServlet`.
+
+The availability metadata is centralized as follows:
+
+| Type | Table | Identifier column |
+|---|---|---|
+| `BSI` | `ais.BSI_GENERAL_INFO` | `BLDG_SAFETY_INSP_REPORT_NO` |
+| `CSR` | `ais.CS_PLAN` | `FILE_PATH_AUTOCAD` |
+| `KAI` | `ais.KAI_RECORD_PLANS_AND_DRAWINGS` | `AUTOCAD_PATH` |
+| `EMMS` | `ais.OLD_EMMS` | `REPORT_LINK` |
+| `DSSR` | `ais.DSSR_REPORT` | `REPORT_NO` |
+
+Slope-only types such as `BWCS`, `VMI`, `RMI`, `AMI`, and `TMCP` remain valid display/report types but do not participate in availability-table queries. `ReportType` exposes `getTableName()`, `getIdColumn()`, and `hasAvailabilityTable()` for the database layer.
+
+Invalid required-report values fail closed instead of silently removing the filter. Unknown planner metadata such as `modifier` is not interpolated into SQL. The existing generic relation executor remains the fallback for plans that cannot be expressed by these canonical dimensions.
+
+A multi-report `check_reports` response is grouped under `checks`, with one standard availability response per registered type. Formatters should render this structure generically rather than adding one branch per report type.
+
+#### Adding a new tool
+
+For a standard new tool, changes are normally limited to `ToolRegistryFactory` plus its database/service implementation:
+
+1. Add the deterministic database/service method.
+2. Add a `registerTool(...)` entry in `ToolRegistryFactory.registerTools()`.
+3. Define accepted and required parameters in the JSON schema.
+4. Declare supported relations.
+5. Declare produced fields.
+6. If it consumes previous location codes, declare `consumedFields` containing `LOC_CD` and accept `locCds` or `locCd`.
+7. Return a standard JSON result with `count` and `results` where applicable.
+8. Add unit/integration tests for direct execution and every supported relation.
+
+No `OllamaService` switch statement is required for a standard tool. No frontend change is required: `listTools()` supplies agent schemas and `listToolsForUI()` supplies `/api/tools` metadata.
+
+If the tool must be selected by the keyword-extraction fast path, its aliases and semantics must also be added to the catalog-driven keyword prompt or the fixed `KEYWORD_EXTRACT_PROMPT`. Agent-loop discovery alone is automatic; fast-path semantic extraction is not fully dynamic yet.
 
 ### Dynamic quick prompt buttons / `/skill` tools list
 
@@ -310,7 +379,155 @@ Tool definitions are fetched once from `GET /api/tools` on page load (`js/chat.j
 
 The panel renders as a numbered list (`1. hardcode_query: get general info`, `2. ...`), not pill buttons. The highlighted (`.active`) row can be moved with `↑`/`↓` (`moveSkillSelection()`), and is applied to the input — filled with that tool's full `samplePrompt` — via `Tab`, `Enter`, or a click (all three funnel into `applyToolPrompt()`). Repeated `Tab` presses cycle forward through the ranked matches only when the highlighted row hasn't changed since the last apply (tracked via `appliedIndex`), so an `↑`/`↓` selection followed by `Tab` always applies exactly the highlighted row instead of skipping past it.
 
-To add a new tool button/list entry, add a new `ToolDef` in `MCPClientService.getToolDefs()`. No frontend changes are needed — `js/chat.js` renders whatever `GET /api/tools` returns.
+To add a new tool button/list entry, register a new `ToolDefinition`/`ToolProvider` through `ToolRegistryFactory.registerTools()`. No frontend changes are needed — `js/chat.js` renders whatever `GET /api/tools` returns.
+
+### Authentication and endpoint RBAC
+
+#### Security package
+
+The authentication and authorization layer is implemented under:
+
+```text
+src/main/java/com/ais/security/
+├── AuthenticationFilter.java
+├── AuthorizationContext.java
+└── SecurityGuards.java
+```
+
+`AuthenticationFilter` is registered in `WEB-INF/web.xml`, not with `@WebFilter`, to avoid double execution. It maps to `/api/*` and `/report/*`, invokes `HttpServletRequest.authenticate(response)` when no trusted principal exists, and checks roles before the request can reach a servlet, LLM, MCP tool, or database query.
+
+Authentication and authorization are deliberately distinct:
+
+- Missing or invalid identity → HTTP `401`.
+- Valid identity without the required role → HTTP `403`.
+- Valid role → attach an immutable `AuthorizationContext` request attribute and continue.
+
+| Route | Required role |
+|---|---|
+| `/api/chat`, `/api/tools` | `AIS_USER` or `AIS_ADMIN` |
+| `/api/location/general-info` | `AIS_USER` or `AIS_ADMIN` |
+| `/api/location/schema` | `AIS_ADMIN` only |
+| Other `/api/*` routes | `AIS_USER` or `AIS_ADMIN` |
+| `/report/*` | `AIS_USER` or `AIS_ADMIN` |
+
+Administrators are treated as users for ordinary endpoints even if the container exposes only `AIS_ADMIN`. `LocationServlet` performs a direct `isUserInRole("AIS_ADMIN")` check in both GET and POST schema branches before schema introspection, providing defense in depth if a filter mapping changes.
+
+The active Tomcat Realm is operational. Keep the anonymous `401`, user `403`, admin `200`, and allowed-route smoke tests in the deployment pipeline.
+#### `web.xml` registration
+
+The minimal descriptor contains these security elements inside the existing `<web-app>` root:
+
+```xml
+<filter>
+    <filter-name>authenticationFilter</filter-name>
+    <filter-class>com.ais.security.AuthenticationFilter</filter-class>
+    <async-supported>true</async-supported>
+</filter>
+<filter-mapping>
+    <filter-name>authenticationFilter</filter-name>
+    <url-pattern>/api/*</url-pattern>
+    <dispatcher>REQUEST</dispatcher>
+</filter-mapping>
+<filter-mapping>
+    <filter-name>authenticationFilter</filter-name>
+    <url-pattern>/report/*</url-pattern>
+    <dispatcher>REQUEST</dispatcher>
+</filter-mapping>
+
+<login-config>
+    <auth-method>BASIC</auth-method>
+    <realm-name>AIS Assistant</realm-name>
+</login-config>
+
+<security-role><role-name>AIS_USER</role-name></security-role>
+<security-role><role-name>AIS_ADMIN</role-name></security-role>
+```
+
+The real XML must contain raw `<`/`>` characters and plain namespace URLs. HTML entities such as `&lt;web-app&gt;` or Markdown links such as `[http://...](http://...)` are not valid content for the deployed `web.xml`.
+
+BASIC authentication is the dependency-free local development mechanism. Production must use HTTPS and should replace it with a corporate Tomcat Realm/LDAP/OIDC/SSO integration. The filter remains unchanged as long as the container supplies authoritative values through `getUserPrincipal()` and `isUserInRole()`.
+
+#### Local `tomcat-users.xml`
+
+Tomcat does not read a `tomcat-users.xml` placed inside the application project or WAR. Merge local roles/users into the active server file:
+
+```text
+Linux/macOS: $CATALINA_BASE/conf/tomcat-users.xml
+Windows:     %CATALINA_BASE%\conf\tomcat-users.xml
+```
+
+Eclipse WTP often uses a separate configuration under the workspace (for example `.metadata/.plugins/org.eclipse.wst.server.core/tmpN/conf/`). Read the `Using CATALINA_BASE` line in the startup console and edit that configuration, not an assumed Tomcat installation path.
+
+Known-good local-only entries:
+
+```xml
+<role rolename="AIS_USER"/>
+<role rolename="AIS_ADMIN"/>
+<user username="ais-user"
+      password="REPLACE_WITH_A_STRONG_LOCAL_PASSWORD"
+      roles="AIS_USER"/>
+<user username="ais-admin"
+      password="REPLACE_WITH_A_DIFFERENT_STRONG_PASSWORD"
+      roles="AIS_USER,AIS_ADMIN"/>
+```
+
+Role names are case-sensitive. Do not commit real credentials. Fully stop and restart Tomcat after changing the user database; an Eclipse incremental republish is insufficient. Repeated failed attempts may trigger `LockOutRealm`, so correct the credentials and restart before retesting.
+
+The active `server.xml` normally includes both the `UserDatabase` global resource (with `pathname="conf/tomcat-users.xml"`) and a `UserDatabaseRealm` nested under `LockOutRealm`. If either is absent, the container cannot validate these users.
+
+#### Authentication diagnostics
+
+```bash
+BASE=http://localhost:8090/ais_ai
+
+# Anonymous: 401, with no LLM/tool/DB work
+curl -i "$BASE/api/tools"
+
+# Normal user: 200 on ordinary route
+curl -i -u 'ais-user:YOUR_LOCAL_PASSWORD' "$BASE/api/tools"
+
+# Normal user: 403 on admin schema route
+curl -i -u 'ais-user:YOUR_LOCAL_PASSWORD' \
+  "$BASE/api/location/schema"
+
+# Admin: passes authentication/RBAC for schema route
+curl -i -u 'ais-admin:YOUR_ADMIN_PASSWORD' \
+  "$BASE/api/location/schema"
+```
+
+A repeating browser prompt plus `curl -u` returning `401` proves the failure is in Tomcat identity validation—not AIS role logic. Check the active `CATALINA_BASE`, exact password, `tomcat-users.xml` filename, `UserDatabaseRealm`, any configured credential-digest handler, and perform a full restart. A `403` instead proves authentication succeeded and the role assignment is wrong.
+
+The public JSP is not covered by the current filter mappings, so it can load before its protected API fetch. Some browsers do not show a BASIC login dialog for `fetch`; open `/api/tools` directly once or use `curl -u` for local diagnosis. Production SSO/form login should provide the real user experience.
+
+#### Security completion criteria
+
+The authentication change is not operational merely because the classes compile. Before marking Issue #8 fixed:
+
+- Tomcat must accept a trusted identity in the deployed environment.
+- Anonymous calls to every protected route must return `401` before any application work.
+- `AIS_USER` must receive `403` from schema access.
+- `AIS_ADMIN` must pass the schema role check.
+- Direct `/report/view` navigation must not bypass authentication.
+- Automated `401`, `403`, and successful-route tests must pass.
+- Cookie/session or browser-cached credential deployments must add CSRF protection to state-changing requests.
+
+### Output HTML sanitization
+
+`ChatServlet` receives HTML assembled by `OllamaService` and returns it as the JSON `answer` field. Because the browser renders the answer as HTML, the final answer is sanitized immediately before JSON serialization.
+
+The policy is implemented with OWASP Java HTML Sanitizer and allows only the elements needed by the application: tables, table cells, basic text formatting, links, report cards, and the location map iframe. Attributes are allowlisted (`class`, table spans, link attributes, and iframe dimensions/source), and only `http`/`https` URL schemes are accepted. Scripts, event-handler attributes such as `onerror`, unsafe URLs, styles, and unsupported elements are removed. The Java 8 dependency is resolved and compilation is clean; browser regression tests remain part of release validation.
+
+The dependency must be declared in `pom.xml` and packaged into `WEB-INF/lib`:
+
+```xml
+<dependency>
+    <groupId>com.googlecode.owasp-java-html-sanitizer</groupId>
+    <artifactId>owasp-java-html-sanitizer</artifactId>
+    <version>20220608.1</version>
+</dependency>
+```
+
+Do not replace the sanitizer with regular expressions. The Java 8 dependency is resolved and the source compiles cleanly; keep the dependency in the WAR and run browser XSS regression tests. Database-derived values are escaped once at the HTML field boundary; do not escape an already-generated HTML document a second time, or values such as `&amp;` become `&amp;amp;`.
 
 ### Configuration & environment
 
@@ -318,10 +535,10 @@ To add a new tool button/list entry, add a new `ToolDef` in `MCPClientService.ge
 
 | Key | Description |
 |---|---|
-| `ollama.base_url` | Ollama server URL (e.g. `http://<ollama-ip>`) — used when no Tencent key is set |
+| `ollama.base_url` | Ollama server URL (e.g. `http://<ollama-ip>:11434`) — used when no Tencent key is set |
 | `ollama.model` | Ollama model name (e.g. `qwen3:4b-q4_K_M`) — used when no Tencent key is set |
 | `tencent.api.key` | Tencent Cloud API key — if set, all LLM calls route to Tencent instead of Ollama |
-| `tencent.api.base_url` | Tencent Cloud API base URL (default: `https://domain`) |
+| `tencent.api.base_url` | Tencent Cloud API base URL (default: `https://api.lkeap.cloud.tencent.com/v1`) |
 | `tencent.api.model` | Tencent model name (e.g. `deepseek-v4-flash`, `deepseek-v3`, `deepseek-r1`, `hunyuan-pro`) |
 | `verifier.model` | Verifier model override. If unset, falls back to `ollama.model` / `tencent.api.model` depending on provider |
 | `ollama.num_ctx` | Context window size (Ollama only) |
@@ -332,7 +549,11 @@ To add a new tool button/list entry, add a new `ToolDef` in `MCPClientService.ge
 | `db.server` | SQL Server host |
 | `db.name` | Database name |
 | `db.pool.*` | HikariCP pool settings |
-| `graph.max.retries` | Max verification retries before best-effort fallback (default: 3) |
+| `graph.max_regenerations` | Maximum full primary-pipeline regenerations (recommended default: 1) |
+| `graph.max_repair_attempts` | Maximum targeted verifier repair rounds (recommended default: 1) |
+| `db.query_timeout_seconds` | JDBC statement timeout in seconds; separate from `db.connection_timeout` in milliseconds |
+| `agent.loop.max_iterations` | Maximum tool-calling iterations in one primary attempt |
+| `agent.loop.timeout_ms` | Agent-loop wall-clock limit in milliseconds |
 | `graph.verification.enabled` | Enable or disable the verifier node (`false` for instant bypass) |
 | `graph.verification.timeout.seconds` | Timeout for the verifier LLM call |
 
@@ -375,14 +596,19 @@ sudo nano /opt/ais_ai/config/application.properties
 sudo chmod 600 /opt/ais_ai/config/application.properties
 
 export APP_CONFIG_PATH=/opt/ais_ai/config/application.properties
+
+# Configure the production Tomcat Realm/enterprise SSO before starting.
+# Do not deploy the local tomcat-users.xml example or BASIC auth over HTTP.
 sudo systemctl start tomcat
 ```
+
+The production identity provider must expose `AIS_USER` and `AIS_ADMIN` through `request.isUserInRole(...)`. Terminate TLS before credentials reach the application, restrict direct backend access when a trusted reverse proxy supplies identity, and never trust caller-provided identity headers.
 
 Minimum `application.properties` for Tencent Cloud mode:
 
 ```properties
 tencent.api.key=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-tencent.api.base_url=https://domain
+tencent.api.base_url=https://api.lkeap.cloud.tencent.com/v1
 tencent.api.model=deepseek-v4-flash
 
 db.server=your-sql-server
@@ -391,10 +617,10 @@ db.user=your-user
 db.password=your-password
 ```
 
-Smoke test:
+Authenticated smoke test (after configuring the active Tomcat Realm/user database):
 
 ```bash
-curl -X POST \
+curl -u 'ais-user:YOUR_LOCAL_PASSWORD' -X POST \
   -H "Content-Type: application/json" \
   -d '{"prompt":"Tell me about SB04400361000"}' \
   http://localhost:8090/ais_ai/api/chat
@@ -405,16 +631,32 @@ curl -X POST \
 #### Add or modify report types
 
 1. Register the new type in `ReportTypeRegistry`.
-2. Update `DatabaseManager.getReports(...)` with report metadata.
-3. Add SQL queries for the new report type.
-4. Extend `buildReportUrl(...)` to construct the right view URL.
+2. For an availability report, provide its trusted table and identifier-column metadata there; `DatabaseManager` consumes the registry and should not gain a report-type switch.
+3. Add SQL/query behavior only when the new report has semantics that are not expressible through the existing registry dimensions.
+4. Extend `buildReportUrl(...)` to construct the right view URL when the report needs a new URL strategy.
 
-#### Add a new tool and quick prompt button
+`ReportServlet` has a separate controller-level mapping for report-view types such as `survey` and `maintenance`; do not use that private mapping as the availability-table registry.
 
-1. Add a new `ToolDef` in `MCPClientService.getToolDefs()` with UI metadata fields.
-2. Implement execution logic inside `MCPClientService.callTool(...)`.
-3. Add required database queries to `DatabaseManager`.
-4. The button appears automatically in `index.jsp` — no frontend changes needed.
+Implementation invariants:
+
+- Keep the availability-table/id-column metadata in `ReportTypeRegistry`; do not add another report-type switch to `DatabaseManager`.
+- Keep the registry constructors unambiguous for Java 8. The metadata form uses an explicit alias collection; the alias-only form may use varargs.
+- `QueryDimensionRegistry.QueryDimension` must be a concrete lambda-compatible class accepting `BiConsumer<LocationQuerySpec, String>`.
+- `QueryDimensionRegistry` maps database dimensions, not individual tools. Do not register a separate query contributor for every tool.
+
+#### Add a new tool and quick prompt entry
+
+1. Add the deterministic database/service method.
+2. Register the tool in `ToolRegistryFactory.registerTools()` with `ToolDefinition`, JSON properties, UI metadata, and an executor.
+3. Declare intent types/aliases, required parameters, supported relations, and produced fields.
+4. If the tool consumes previous location codes, declare `LOC_CD` in `consumedFields` and accept `locCds` or `locCd`.
+5. Return a standard `{count, results}` response with `LOC_CD` rows where applicable.
+6. Ensure the factory's `definition(...)` helper passes `consumedFields` to the full `ToolDefinition` constructor; otherwise `use_previous_codes` validation will reject the tool even when its registration looks correct.
+7. Add direct-call and relation tests.
+8. The tool appears automatically in `listTools()`, the agent loop, `/api/tools`, and `/skill`; no frontend changes are needed.
+9. If fast-path keyword extraction must select the new tool, update the catalog-generated or fixed keyword prompt with its semantic guidance.
+
+Separate provider classes are optional at this stage. The factory may keep anonymous `ToolProvider` executors and can be split by domain later.Do not add a new tool-specific branch to `OllamaService.executePlan()`. If a new tool needs behavior that cannot be expressed by the standard relations or result contract, first extend the catalog/provider contract rather than adding another intent switch.
 
 #### Add a new graph node
 
@@ -432,6 +674,12 @@ To switch from Tencent Cloud back to Ollama, remove or leave blank the `tencent.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
+| Repeated BASIC login prompt; curl returns `401` | Tomcat rejected the identity/password | Edit the active `$CATALINA_BASE/conf/tomcat-users.xml`, confirm `UserDatabaseRealm`, restart Tomcat; see authentication section |
+| Login succeeds but route returns `403` | Authenticated user lacks the case-sensitive required role | Assign `AIS_USER`; schema additionally requires `AIS_ADMIN` |
+| No browser login prompt but API calls fail | The public JSP loads before the protected fetch, and the browser may not show BASIC UI for fetch | Open `/api/tools` directly once or test with `curl -u`; use SSO/form login for production UX |
+| `ClassNotFoundException: com.ais.security.AuthenticationFilter` | Security source not compiled into the WAR | Confirm the class is under `src/main/java/com/ais/security/` and rebuild with `mvn clean package` |
+| `HtmlPolicyBuilder cannot be resolved` | OWASP sanitizer dependency missing or Maven project not refreshed | Add `owasp-java-html-sanitizer` to `pom.xml`, run `mvn clean package`, then update the Eclipse Maven project |
+| `LLM SQL request completed` | Raw SQL execution finished | Review row count/duration audit data; do not log or return the raw SQL statement |
 | Empty prompt in logs | Frontend Content-Type mismatch | Ensure `Content-Type: application/json` |
 | `Invalid column name MOD_TIME` | Table missing timestamp column | `DatabaseManager.getOrderColumn()` auto-detects |
 | LLM never responds (Ollama mode) | Ollama unreachable | Run `curl http://<ollama-ip>:11434/api/tags` |
@@ -440,7 +688,7 @@ To switch from Tencent Cloud back to Ollama, remove or leave blank the `tencent.
 | Tencent returns 429 | Rate limit exceeded | Reduce request frequency or upgrade plan |
 | Verifier always auto-approves | LLM service unreachable | Check network and API key config |
 | Verifier rejects valid answers | Verifier prompt too strict | `VerifierNode` remaps REJECTED → RETRY; check logs |
-| Graph loops indefinitely | `MAX_RETRIES` too high or router bug | Check `GraphState.MAX_RETRIES` and router logic |
+| Graph loops or takes several minutes | Repeated SQL fallback, swallowed timeout, or retry budgets too high | Check structured `QUERY_TIMEOUT`, one-SQL-attempt guard, and separate regeneration/repair counters |
 | `500` on production only | OkHttp SSL truststore error | See [Known issues & fixes](#known-issues--fixes) |
 | `/api/tools` returns 404 | `ToolsServlet` not compiled | Verify class exists in `target/classes/` |
 | Infinite retry on failed tool | Keyword cache trapping retries | `extractKeywords()` checks `isRetry` to bypass cache |
@@ -479,10 +727,12 @@ To switch from Tencent Cloud back to Ollama, remove or leave blank the `tencent.
   Edge → primary_llm                         unconditional edge taken
 → Executing node: verifier (step 3)          verifier running
 🌐 Tencent simple request → model=deepseek-v4-flash  Tencent Cloud call
-[VerifierNode] Result=APPROVED               verification passed
-[Router] RETRY → primary_llm (attempt 2)    retrying after soft rejection
-=== Graph Execution Complete [10863ms, 4 steps] ===
-Execution path: [planner [0ms], primary_llm [10ms], verifier [6807ms], formatter [10863ms]]
+[VerifierNode] Result=RETRY, Repair=REINVOKE_TOOL
+[Router] RETRY → patch (attempt 1)            targeted repair requested
+→ Executing node: patch (step 4)              catalog-validated MCP call
+[PatchRouter] Repair succeeded → verifier     re-verifying patched answer
+=== Graph Execution Complete [10863ms, 6 steps] ===
+Execution path: [planner, primary_llm, verifier, patch, verifier, formatter]
 ```
 
 ---
@@ -500,7 +750,8 @@ This pattern is equivalent to the Python LangGraph library but built from scratc
 Without verification, whatever the primary LLM returns goes directly to the user. With the graph:
 
 - A second LLM call independently checks whether the response actually answers the question.
-- If the response is incomplete, the graph retries automatically (up to `MAX_RETRIES` times).
+- If the response is incomplete and the verifier identifies a specific missing tool call, `PatchNode` performs a bounded catalog-validated repair and sends the result through verification again.
+- If no targeted repair is possible, the graph may regenerate the primary pipeline within the separate configured regeneration budget.
 - If all retries fail, the graph falls back to a safe message rather than showing a bad answer.
 - Every response shown to the user has been verified by a second model call.
 
@@ -510,7 +761,8 @@ Without verification, whatever the primary LLM returns goes directly to the user
 |---|---|---|
 | `planner` | `PlannerNode` | Detects intent from the query text (LOCATION_CODE, PSM, DEPARTMENT, etc.) and stores it in state |
 | `primary_llm` | `PrimaryLlmNode` | Calls `OllamaService.invoke(prompt, sessionId)` which runs keyword extraction, query planning, tool calls, and the agent loop. Stores the answer in `state.primaryResponse` |
-| `verifier` | `VerifierNode` | Calls `OllamaService.callLlmSimple()` to ask whether the primary response answers the question. Routes to Tencent Cloud or Ollama based on config. Parses the JSON verdict and stores APPROVED / RETRY in state |
+| `verifier` | `VerifierNode` | Calls `OllamaService.callLlmSimple()` to ask whether the primary response answers the question. Routes to Tencent Cloud or Ollama based on config. Parses the verdict plus structured repair feedback (`suggestedAction`, `missingTools`, and `toolArgs`) and stores it in `GraphState` |
+| `patch` | `PatchNode` | Resolves verifier-suggested tools through the catalog, filters arguments against the accepted schema, optionally reuses previous `LOC_CD` values through the shared `locCds`/`locCd` contract, invokes the dispatcher, appends dynamically formatted, collapsible HTML details and native tables (instead of raw JSON dumps) of the repair output, and sends successful repairs back to `verifier` |
 | `formatter` | `FormatterNode` | Copies `primaryResponse` to `finalResponse`, sets `success=true` |
 | `fallback` | `FallbackNode` | Sets a safe error message as `finalResponse`, sets `success=false` |
 
@@ -526,15 +778,17 @@ This is useful for local development or when verifier latency is unacceptable. T
 
 ### Edge routing
 
-```
-planner ──────────────────────────────► primary_llm
-primary_llm ──────────────────────────► verifier          (when enabled)
-verifier (APPROVED / null / SKIPPED) ─► formatter ──► END
-verifier (RETRY, canRetry) ───────────► primary_llm   (increments retryCount)
-verifier (RETRY, maxRetries reached) ─► formatter ──► END  (best-effort answer)
+```text
+planner ─────────────────────────────► primary_llm
+primary_llm ─────────────────────────► verifier          (when enabled)
+verifier (APPROVED / null / SKIPPED) ► formatter ──► END
+verifier (RETRY + repair request) ───► patch ──► verifier
+verifier (RETRY without repair) ────► primary_llm       (increments retryCount)
+verifier (RETRY, maxRetries reached) ► formatter ──► END (best-effort answer)
+patch (repair unavailable) ─────────► primary_llm       (bounded fallback)
 ```
 
-`REJECTED` is remapped to `RETRY` inside `VerifierNode` so the graph always retries before giving up. Only after `MAX_RETRIES` is exhausted does the router send to `formatter` with the best available answer.
+`REJECTED` is remapped to `RETRY` inside `VerifierNode` so the graph always retries before giving up. A concrete `REINVOKE_TOOL` repair request goes through `PatchNode` first and is re-verified. Only after the bounded repair/regeneration budgets are exhausted does the router send to `formatter` with the best available answer.
 
 ### GraphState fields
 
@@ -548,8 +802,10 @@ verifier (RETRY, maxRetries reached) ─► formatter ──► END  (best-effor
 | `rawToolOutput` | `String` | Combined text summary of ALL tool outputs concatenated together (kept for backward compatibility; do not use this to render per-call UI cards — see `toolCallDetails`) |
 | `toolCallDetails` | `List<Map<String, Object>>` | One entry per real tool invocation, each with its own `name`, `args` (a real `Map`, not a placeholder), and `result` (that call's own output only). Populated by `PrimaryLlmNode` from `AgentResult.getToolCalls()`. This is what `ChatServlet.buildToolCallsJson()` should serialize for the `/api/chat` `toolCalls` array — see [Known issues & fixes](#known-issues--fixes) for the bug this field fixes. |
 | `verificationResult` | `enum` | APPROVED / RETRY / REJECTED / SKIPPED |
-| `verificationReason` | `String` | Verifier's explanation |
-| `retryCount` | `int` | Number of retries so far |
+| `verificationReason` | `String` | Verifier's explanation, including targeted-repair status |
+| `verifierFeedback` | `VerifierFeedback` | Structured verifier output: `suggestedAction`, `missingTools`, `toolArgs`, `reason`, and `confidence`. Tool names/arguments are untrusted until catalog validation in `PatchNode` |
+| `repairAttempted` / `repairSucceeded` | `boolean` | Tracks whether a targeted patch ran and whether at least one validated tool call succeeded |
+| `retryCount` | `int` | Number of bounded retry/repair cycles so far |
 | `finalResponse` | `String` | Response shown to user |
 | `success` | `boolean` | Whether the graph completed successfully |
 | `executionPath` | `List<String>` | Audit trail of nodes with timestamps |
@@ -571,19 +827,30 @@ verifier (RETRY, maxRetries reached) ─► formatter ──► END  (best-effor
 
 ### Verifier behavior
 
-The verifier node sends a short prompt to the configured LLM asking for a JSON verdict:
+The verifier node sends a short prompt to the configured LLM asking for structured JSON:
 
 ```json
-{ "verdict": "APPROVED", "confidence": 0.9, "reason": "Response contains location data" }
+{
+  "verdict": "RETRY",
+  "confidence": 0.9,
+  "reason": "The answer did not check KAI availability",
+  "suggestedAction": "REINVOKE_TOOL",
+  "missingTools": ["check_reports"],
+  "toolArgs": {
+    "check_reports": {"reportType": "KAI"}
+  }
+}
 ```
 
 Rules applied after parsing the verdict:
 
 - `APPROVED` with confidence below 0.5 is treated as `RETRY`.
 - `REJECTED` is remapped to `RETRY` (the graph always retries before giving up).
+- `REINVOKE_TOOL` is used only when at least one concrete missing tool is supplied; otherwise the graph uses ordinary regeneration.
+- Tool names and arguments are untrusted model output. `PatchNode` resolves the name through the catalog, filters arguments against the accepted schema, and lets `ToolDispatcher` perform final validation.
+- A successful targeted repair is sent back through `VerifierNode`; it is not considered approved merely because the tool call succeeded.
 - If the LLM service is unreachable or `graph.verification.enabled=false`, the verifier fails open (auto-approves) so the user still gets an answer.
-- Responses shorter than 100 characters are auto-approved without calling the verifier.
-- Responses matching known failure patterns (`no results found`, `0 results`, etc.) are sent directly to `RETRY` without an LLM call.
+- Responses shorter than 100 characters or matching configured failure patterns are sent directly to `RETRY` without an additional verifier call.
 
 ### Verifier fail-open design
 
@@ -601,19 +868,21 @@ This means the graph degrades gracefully to the same behavior as before verifica
 
 ## API endpoints
 
-| Method | URL | Description |
-|---|---|---|
-| `POST` | `/api/chat` | Send a prompt, get a verified AI-generated answer |
-| `GET` | `/api/chat?prompt=...` | Browser-friendly prompt testing |
-| `GET` | `/api/tools` | Returns tool UI metadata for quick prompt buttons |
-| `POST` | `/api/location/general-info` | Get a single location row by `locCd` |
-| `GET/POST` | `/api/location/schema` | Database schema introspection |
-| `GET` | `/report/view?type=<type>&locCd=<locCd>&reportId=<reportId>` | Render a specific report detail page |
+| Method | URL | Required role | Description |
+|---|---|---|---|
+| `POST` | `/api/chat` | `AIS_USER` or `AIS_ADMIN` | Send a prompt, get a verified AI-generated answer |
+| `GET` | `/api/chat?prompt=...` | `AIS_USER` or `AIS_ADMIN` | Browser-friendly prompt testing |
+| `GET` | `/api/tools` | `AIS_USER` or `AIS_ADMIN` | Returns tool UI metadata for quick prompt buttons |
+| `POST` | `/api/location/general-info` | `AIS_USER` or `AIS_ADMIN` | Get a single location row by `locCd` |
+| `GET/POST` | `/api/location/schema` | `AIS_ADMIN` | Database schema introspection; also guarded inside `LocationServlet` |
+| `GET` | `/report/view?type=<type>&locCd=<locCd>&reportId=<reportId>` | `AIS_USER` or `AIS_ADMIN` | Render a specific report detail page |
 
 ### Chat endpoint
 
+All examples below require credentials from the active Tomcat Realm. Substitute real local values; never commit them.
+
 ```bash
-curl -X POST \
+curl -u 'ais-user:YOUR_LOCAL_PASSWORD' -X POST \
   -H "Content-Type: application/json" \
   -d '{"prompt":"Tell me about SB04400361000"}' \
   http://localhost:8090/ais_ai/api/chat
@@ -643,19 +912,21 @@ Each entry in `toolCalls` carries **its own** `args` and `result` (see `GraphSta
 ### Tools endpoint
 
 ```bash
-curl http://localhost:8090/ais_ai/api/tools
+curl -u 'ais-user:YOUR_LOCAL_PASSWORD' \
+  http://localhost:8090/ais_ai/api/tools
 ```
 
 ### Location schema endpoint
 
 ```bash
-curl http://localhost:8090/ais_ai/api/location/schema
+curl -u 'ais-admin:YOUR_ADMIN_PASSWORD' \
+  http://localhost:8090/ais_ai/api/location/schema
 ```
 
 ### Location info endpoint
 
 ```bash
-curl -X POST \
+curl -u 'ais-user:YOUR_LOCAL_PASSWORD' -X POST \
   -H "Content-Type: application/json" \
   -d '{"locCd":"SB04400361000"}' \
   http://localhost:8090/ais_ai/api/location/general-info
@@ -719,40 +990,43 @@ FROM [ais].[A_GENERAL_INFO];
 
 ### LLM-generated scalable execution plans
 
-The keyword extraction prompt now asks the LLM to return an ordered `plan` array. Each `IntentStep` has:
+Keyword extraction can return an ordered `plan` array. Each `IntentStep` has:
 
-- `type` — the tool/intent to run (e.g., `PSM_LOCATIONS`, `HISTORIC_BUILDING`, `CHECK_REPORTS`).
-- `priority` — execution order (1 runs first).
+- `type` — resolved through `ToolDefinition` intent types or aliases.
+- `priority` — execution order; `QueryPlanner` sorts by priority.
 - `params` — arguments for that step.
-- `relation` — how the step relates to the previous step:
-  - `independent` — run normally.
-  - `filter_previous` — keep only `LOC_CD` values that appear in both this result and the previous result.
-  - `enrich_previous` — merge attributes from this result into the previous result rows.
-  - `use_previous_codes` — pass all previous `LOC_CD` values as input to this step.
+- `relation` — one of:
+  - `independent` — execute normally.
+  - `filter_previous` — retain only codes present in both the previous and current result.
+  - `enrich_previous` — merge current-step attributes into previous result rows.
+  - `use_previous_codes` — inject previous `LOC_CD` values into the target tool's `locCds` or `locCd` argument.
 
-`OllamaService.executePlan()` applies these relations generically, so adding a new multi-step pattern no longer requires hardcoding every combination in the executor. `QueryPlanner` keeps its rule engine as a fallback when the LLM does not return a `plan`.
+`QueryPlanner` validates each relation against the tool catalog. Unsupported relations, invalid first-step filtering/enrichment, missing required parameters, and `use_previous_codes` tools that do not consume `LOC_CD` are rejected before execution.
 
-When the LLM returns a `plan`, `QueryPlanner.convertLlmPlan()` guarantees that a modifier such as `FIRST` is attached to **exactly one** step — the final answer step. The rule is:
+`OllamaService.executePlan()` then applies relations generically. It determines the answer step by preferring the last executable step with an explicit modifier, including dependent `use_previous_codes` steps. If no modifier exists, the last executable step is the answer step.
 
-- For `filter_previous` / `enrich_previous` chains, the modifier stays on the **final filtering/enriching step** (e.g., `HISTORIC_BUILDING` in a HISTORIC+PSM query).
-- For `use_previous_codes` chains, the modifier moves to the **previous step** that produced the codes (e.g., `PSM_LOCATIONS` when the next step is `CHECK_REPORTS`).
-- Any modifier the LLM may have placed on an intermediate step is stripped and relocated to the correct target, preventing the bug where `FIRST` was applied to an intermediate step and collapsed the result set before cross-filtering.
+`QueryPlanner.distributeModifier()` preserves an explicitly assigned modifier on its original step. This is important for plans such as:
 
-For `NAME_SEARCH` steps, the plan distinguishes between the **subject to search** (`locName`) and the **district/area filter** (`location`). For example, `Which playground in Lo Wu has a historic status?` produces `NAME_SEARCH{locName=playground, location=Lo Wu}` rather than searching for the district name itself. `OllamaService.buildArgs()` now normalizes `locationFilter`, `location`, and `locationName` so the DB-side filter is applied consistently.
+```text
+NAME_SEARCH (independent)
+DECLARED_MONUMENT (use_previous_codes, modifier=OLDEST)
+```
 
-### Monument-to-grade enrichment (`enrichWithHistoricGrade`)
+The `OLDEST` modifier must remain on `DECLARED_MONUMENT`; moving it to `NAME_SEARCH` would compare the wrong result set.
 
-When a plan contains `DECLARED_MONUMENT` followed by `HISTORIC_BUILDING` with `relation=enrich_previous`, `OllamaService.executePlan()` detects the `HISTORIC_BUILDING` intent and delegates to `enrichWithHistoricGrade()` instead of the generic `enrichWithPrevious()`. This method:
+For `NAME_SEARCH` steps, the plan distinguishes the subject (`locName`) from the district/area (`location`). For example:
 
-1. Builds a grade lookup map (`LOC_CD` → `GRD_HIST_BLDG`) from the historic buildings result.
-2. Iterates over all monument rows and injects the matching grade into each row.
-3. Supports a `gradeFilter` parameter:
-   - `ALL` — no filtering, just enrich with grades (including `N/A` for ungraded).
-   - `GRADED` — keep only monuments that have a non-empty, non-zero grade.
-   - `1`, `2`, `3` — keep only monuments with that specific grade.
-4. Returns a merged result with `enriched: true` so the HTML formatter renders the extra `Historic Grade` column.
+```text
+NAME_SEARCH(locName=playground, location=Lo Wu)
+```
 
-The result is formatted by `formatDeclaredMonuments()`, which shows a table with Code, Name, Address, Monument flag, and (when enriched) Historic Grade columns.
+This prevents a district name from accidentally replacing the actual search subject.
+
+### Generic enrichment (`enrichWithPrevious`)
+
+`enrich_previous` is now handled through the generic `LOC_CD`-keyed merge path. The executor does not need a special branch for a monument-plus-historic combination. Providers that support enrichment declare `enrich_previous` in `supportedRelations` and return rows keyed by `LOC_CD`.
+
+A provider may still expose domain-specific fields such as `GRD_HIST_BLDG`; the generic merger preserves those fields and the formatter renders them when present. Any future provider can participate in enrichment by following the same result contract without adding a new case to `OllamaService`.
 
 ### SQL generation fallback for empty tool results
 
@@ -798,9 +1072,9 @@ The app includes an advanced `QueryPlanner` that pre-validates extracted paramet
 
 - **Fast Path (`needsLlm=false`):** Used when the user provides explicit, exact parameters for a tool (e.g., `deptCd=AFCD`), saving LLM compute.
 - **Autonomous Path (`needsLlm=true`):** If an intent lacks its required parameter, `QueryPlanner` routes to the LLM Agent Loop or SQL Generator.
-- **Natural Language Filter Guards:** In `matchExactTemplatePrompt()`, a scalability guard inspects prompt phrasing; if natural language filtering keywords (e.g. `with`, `without`, `not`, `non`, `has`, `have`, `having`, `excluding`, `except`, `where`, `in`, `at`, `near`) are present, it bypasses dumb regex templates and hands the prompt to the LLM semantic engine for robust parameter extraction.
-- **Dynamic Multi-Report Chaining:** Requests for multiple report types (e.g., "BSI and KAI") generate separate `CHECK_REPORTS` steps in the LLM plan, each with `filter_previous` relation, so the executor computes the intersection of codes across all requested report types.
-- Multi-step queries such as PSM report checks, department report checks, and code-history lookups are handled end-to-end.
+- **Natural Language Filter Guards:** Canonical parameters are extracted into the structured keyword object and validated by the planner. Do not add a new semantic prompt-regex detector for a new tool or filter; use the catalog schema and database-dimension registry instead.
+- **Dynamic Multi-Report Chaining:** Requests for multiple report types (e.g., "BSI and KAI") generate ordered `CHECK_REPORTS` steps. The first report step consumes the previous location list with `use_previous_codes`; later report steps consume the narrowed code list with `use_previous_codes`, while the normalized result contract and generic filtering preserve the intersection.
+- Multi-step queries such as PSM report checks, department report checks, and code-history lookups are validated against `ToolDefinition` relation and consumed-field metadata before execution.
 
 ### Dynamic T-SQL Generation & Table Formatting
 
@@ -837,31 +1111,23 @@ The `sanitizeGrade()` method normalizes LLM-extracted grade values to a controll
 
 The `GRADED` sentinel is used by `enrichWithHistoricGrade()` to keep only locations that have a non-empty, non-zero historic grade — effectively filtering out ungraded entries while still enriching with the actual grade values.
 
-### Post-step chain actions (`runPostStepChains`)
+### Generic post-processing and modifiers
 
-After each tool call in `executePlan()`, the `runPostStepChains()` method runs a list of registered chain actions. Each chain is a trigger-condition + action pair. Adding a new chain = add one `if` block. No changes needed to `executePlan()` itself.
+`postProcess()` is intentionally limited to generic session bookkeeping: it extracts location codes from the standardized tool result and stores them for later referential prompts. It does not contain a per-tool post-step chain.
 
-| Chain | Trigger condition | Action |
-|---|---|---|
-| **Auto-fetch current code** | `CODE_HISTORY` intent + searched code is a former code (not in `currentCodes` list) | Automatically calls `hardcode_query` for each current code and appends full location details below the history table |
-| **Auto-fetch first PSM location** | `PSM_LOCATIONS` intent + `autoFetchFirst=true` param | Calls `hardcode_query` on the first `LOC_CD` in results and appends full details |
-| **Auto-check reports** | Any intent + `autoCheckReports=BSI,KAI,...` param + non-empty `lastCodes` | Calls `check_reports` for each report type in the comma-separated list |
+Relations are expressed in the plan itself. Use `filter_previous`, `enrich_previous`, or `use_previous_codes` rather than adding a new hardcoded chain to `OllamaService`.
 
-### Post-filtering agent-loop results by location
+`findByYear()` remains a domain-specific modifier implementation for OLDEST/NEWEST. It reads candidate completion years in one batched `DatabaseManager.getGeneralInfoBatch()` query and fetches full details only for the winner.
 
-When the agent loop calls `search_declared_monument` or `search_historic_building`, `postProcess()` checks the user prompt for a location name (e.g., "in Lo Wu", "in Sha Tin") via `extractLocationFromPrompt()`. If found, `filterResultsByLocation()` narrows the results by matching the keyword against each row's `LOC_NAME` and `ADDRESS` fields. This is a second filtering layer on top of the DB-side location filter — it catches cases where the DB query returned global results but the user meant a specific place.
+### Post-filtering and provider contracts
 
-If the prompt also contains "oldest" or "earliest", the filtered results are passed to `findByYear()`, which now fetches `BLDG_COMPLETION_YEAR` (and `LOC_NAME`/`DEPT_CD`/`DEPT_DESC`) for **all** candidates in a single batched query (`DatabaseManager.getGeneralInfoBatch()`), compares years in Java, and calls `hardcode_query` **once** for the winning code so the formatter can render its full detail card. The older `findOldestWithDetails()` did this comparison by calling `hardcode_query` once *per candidate* — see [Known issues & fixes](#known-issues--fixes) for why that was a real production bug, not just an inefficiency.
+Location filtering should be performed by the provider/database when the tool accepts a `location` parameter. For compatible combinations of canonical dimensions, `PlanOptimizer` uses `location_query` so the database applies the predicates in one query. Generic Java relation processing only intersects or enriches standardized result rows when the plan cannot be collapsed. A new provider should return location rows under `results[]` with `LOC_CD`; this allows code extraction and relation processing without a tool-name check.
 
 ### Extensible plan execution with modifier safety nets
 
-`executePlan()` computes the "answer step" — the step whose result is shown to the user — and applies modifiers (OLDEST/NEWEST/FIRST/COUNT) only to that step. The answer step is determined by:
+`executePlan()` computes the answer step and applies modifiers (OLDEST/NEWEST/FIRST/COUNT) only to that step. It first chooses the last executable step with an explicit modifier, including `use_previous_codes` steps. If no modifier is present, it chooses the last executable step. This keeps a modifier on the dependent step when that step is the actual answer, while avoiding duplicate detail rendering through the redundant-detail guard.
 
-1. Walking backward through the plan to find the last step whose relation is not `use_previous_codes`.
-2. Validating that the candidate step has a recognized tool mapping via `resolveToolName()`.
-3. If the candidate has no tool (e.g., the LLM invented an unknown type like `DEPARTMENT_INFO`), walking further backward to find a recognized step.
-
-When a step is skipped because no tool is mapped, any modifier it carried is transferred to the answer step so it is not lost. This prevents the bug where the `OLDEST` modifier landed on an unrecognized `DEPARTMENT_INFO` step and was never applied.
+`QueryPlanner.distributeModifier()` preserves explicit step modifiers. A top-level keyword modifier is assigned only when no step already declares one. Unknown relation values, unsupported relations, invalid first-step filtering/enrichment, and missing consumed fields are rejected by the planner before execution.
 
 ### LLM step type alias normalization
 
@@ -876,33 +1142,13 @@ The keyword extraction prompt now includes a `VALID PLAN STEP TYPES` section tha
 
 This three-layer defense (prompt constraint → parse-time normalization → runtime validation in `executePlan()`) prevents the LLM from inventing unsupported step types that would silently fail.
 
-### `withReport` extraction for chained report checks
+### Generic code extraction and relation filtering
 
-`check_reports` returns a different JSON format than other tools — it uses `withReport`/`withoutReport` arrays instead of a `results` array. Two methods were updated to handle this format, enabling chained `CHECK_REPORTS` steps to properly compute intersections:
+Tools should prefer the standard `results[]` contract, but the current generic extractor also walks nested response objects and collects `LOC_CD` and `CURRENT_LOC_CD` fields. This means legacy response shapes such as report availability arrays can participate in session memory and relation processing without a `check_reports` tool-name branch.
 
-**`extractCodesFromResult()`** — now includes a 4th extraction case:
+`crossFilter()` uses the extracted code sets and preserves the current step's rows when possible. It fails closed: an empty code set, missing row array, or processing exception produces an empty filtered result rather than returning unrelated unfiltered rows.
 
-| Case | Format | Used by |
-|---|---|---|
-| 1 | `results[]` array | `locations_by_dept`, `search_by_name`, etc. |
-| 2 | `general.LOC_CD` (single location) | `hardcode_query` |
-| 3 | Top-level `LOC_CD` | `findByYear`, structured responses |
-| 4 | `withReport[]` array | `check_reports` |
-
-Without case 4, `extractCodesFromResult()` returned empty after a `check_reports` step, causing subsequent steps to re-check all codes from session memory instead of the narrowed set.
-
-**`crossFilter()`** — now detects `check_reports` format:
-
-```java
-// If second result is check_reports format (withReport/withoutReport),
-// extract the "have report" codes and filter first result's rows
-if (!secondArr.isArray() && secondNode.has("withReport")) {
-    // Build set from withReport, filter firstArr to matching codes
-}
-```
-
-Without this, `crossFilter()` silently returned the second result unchanged when the first input was `check_reports` format, because it couldn't find a `results` array in either input.
-
+New providers should still use the standard response shape because it gives the best behavior for formatting, truncation, filtering, enrichment, and future tools.
 ### Generalized intersection summary (`describeStep`)
 
 After all `filter_previous` steps execute, `executePlan()` checks whether two or more chained filters were applied. If so, it appends an intersection summary showing which codes survived all filters and a human-readable description of each filter:
@@ -928,7 +1174,7 @@ This is generalized — it works for any combination of `filter_previous` steps 
 
 ### Auto-generated `/skill` tools list
 
-Quick prompt entries are auto-generated from tool definitions in `MCPClientService`. Adding a new tool automatically creates a matching row in the `/skill` list — see [Dynamic quick prompt buttons / `/skill` tools list](#dynamic-quick-prompt-buttons--skill-tools-list) in the developer guide for the ranking/keyboard-navigation details.
+Quick prompt entries are auto-generated from the shared catalog built by `ToolRegistryFactory` and exposed through `MCPClientService`. Adding a new tool automatically creates a matching row in the `/skill` list — see [Dynamic quick prompt buttons / `/skill` tools list](#dynamic-quick-prompt-buttons--skill-tools-list) in the developer guide for the ranking/keyboard-navigation details.
 
 ### Keyword extraction and hybrid routing
 
@@ -990,11 +1236,11 @@ Every list-returning `DatabaseManager` method (`getLocationsByPsm`, `getLocation
 
 The user-facing phrase is detected end-to-end through the whole pipeline:
 
-1. **Regex Template Gateway (fast path):** `matchExactTemplatePrompt()`'s PSM template captures an optional leading `top N`/`first N` (e.g. `"Show top 50 locations under PSM kt"` → `psm=KT, limit=50`) directly into the `ExtractedKeywords` object it builds.
+1. **Structured extraction:** the keyword object carries `limit`, `excludeUndefinedField`, and canonical filter parameters; the backend clamps and validates them before database execution.
 2. **General prompt-level detection:** `OllamaService.extractLimitFromPrompt()` (a standalone `(?i)\b(?:top|first)\s+(\d{1,4})\b` regex) runs once per request in `invoke()` and applies to `keywords.getLimit()` if the template path didn't already set one — this covers free-text phrasing that doesn't match an exact template.
 3. **`QueryPlanner`** copies `kw.getLimit()` into the plan step's `params` map, in both the single-intent loop (`analyse()`) and the LLM-generated-plan path (`convertLlmPlan()`).
 4. **`OllamaService.buildArgs()`** reads `intent.params.get("limit")` and puts it into the tool-call `args` map for `NAME_SEARCH`, `PSM_LOCATIONS`, `DEPARTMENT_LOCATIONS`, `DECLARED_MONUMENT`, and `HISTORIC_BUILDING`.
-5. **`MCPClientService`**'s handlers for those 5 tools read `args.get("limit")` and pass it through to the matching `DatabaseManager` method; the tool's JSON schema also exposes `limit` as an LLM-settable parameter so the agent loop can set it directly without relying on the prompt-text regex.
+5. **`ToolRegistryFactory`'s registered executors** for those 5 tools read `args.get("limit")` and pass it through to the matching `DatabaseManager` method; the tool JSON schemas also expose `limit` as an LLM-settable parameter so the agent loop can set it directly without relying on the prompt-text regex. `MCPClientService` remains the compatibility facade over this catalog.
 
 ### "Exclude undefined `<field>`" filter across all list-returning tools
 
@@ -1005,7 +1251,7 @@ Wired end-to-end the same way as the `limit` feature, but leveraging **scalable 
 1. **LLM Keyword Extraction (Phase 1):** The system prompt (`KEYWORD_EXTRACT_PROMPT`) instructs the LLM to extract `excludeUndefinedField` (`"address"`, `"name"`, `"department"`) natively from any natural language phrasing (`"with address not null"`, `"real address"`, `"valid name"`, `"with address not undefined"`). This eliminates brittle Java-side regex stripping (`stripExcludeUndefinedPhrase`) that previously swallowed tokens into greedy capture groups or broke referential session memory.
 2. **Plan Step Parameter Propagation:** In `OllamaService.invoke()`, right after `QueryPlanner.analyse()`, a loop checks if `keywords.getExcludeUndefinedField()` is present and automatically injects `"excludeUndefinedField"` into `step.params` for every step in the plan. This guarantees that Fast Path (`needsLlm=false`) queries never drop the filter.
 3. **Tool Parameter Binding:** `OllamaService.buildArgs()`'s `putExcludeUndefinedIfPresent()` helper copies `intent.params.get("excludeUndefinedField")` into the tool-call `args` map for the 5 list-returning tools (`NAME_SEARCH`, `PSM_LOCATIONS`, `DEPARTMENT_LOCATIONS`, `DECLARED_MONUMENT`, `HISTORIC_BUILDING`).
-4. **Autonomous Agent Loop & Schema Exposure:** In `MCPClientService.java`, the tool definitions (`excludeUndefinedProp()`) expose `excludeUndefinedField` as an enum-constrained string parameter (`["address", "name", "department"]`). When the fast path is skipped or returns empty, the autonomous agent loop reads the tool schema and sets `excludeUndefinedField` directly without any Java pre-validation.
+4. **Autonomous Agent Loop & Schema Exposure:** The tool definitions built by `ToolRegistryFactory` expose `excludeUndefinedField` as an enum-constrained string parameter (`["address", "name", "department"]`). When the fast path is skipped or returns empty, the autonomous agent loop reads the catalog schema and sets `excludeUndefinedField` directly without any Java pre-validation.
 5. **Database Execution:** `DatabaseManager.appendExcludeUndefinedFilter(sql, alias, column)` appends the WHERE clause excluding all four undefined placeholder cases.
 
 ### Tool-call deduplication (`AgentResult.findEquivalentCallResult`)
@@ -1066,6 +1312,19 @@ Call this immediately before every `executeQuery()` in any method that builds SQ
 ---
 
 ## Known issues & fixes
+
+### Schema endpoint defense-in-depth authorization
+
+**Symptom before the fix:** The global filter required `AIS_ADMIN`, but a future filter-mapping regression could have exposed `LocationServlet` schema introspection directly.
+
+**Fix:** `LocationServlet.doGet()` and `LocationServlet.doPost()` both check `req.isUserInRole("AIS_ADMIN")` before calling `DatabaseManager.introspectSchema()`. A normal authenticated user receives `403`; an administrator may continue. The global `AuthenticationFilter` remains the primary route boundary.
+
+### Final-answer HTML XSS mitigation
+
+**Symptom before the fix:** `ChatServlet` serialized `state.getFinalResponse()` directly. If an LLM response or database value reached the browser as unsafe HTML, the UI could render script elements or event handlers.
+
+**Fix:** `ChatServlet.buildResponse()` passes the final answer through an OWASP Java HTML Sanitizer allowlist immediately before placing it in the JSON response. Database-derived values are still escaped in `OllamaService`; the sanitizer is the final defense for the complete assembled answer. The sanitizer dependency is present in `pom.xml` and must remain packaged in the WAR.
+
 
 ### OkHttp SSL truststore error on production (500 on init)
 
@@ -1169,10 +1428,10 @@ bin/application.properties
 
 **Fix:**
 
-1. `QueryPlanner.convertLlmPlan()` now strips modifiers from every step and reattaches the modifier to exactly one target step: the last step that is not `use_previous_codes`. For HISTORIC+PSM this is `HISTORIC_BUILDING` (the `filter_previous` step), so the cross-filter runs against the full PSM list and the `FIRST` modifier is applied only to the intersection.
-2. `OllamaService.executePlan()` adds a runtime safety net: it precomputes the "answer step" (the last step that is not `use_previous_codes`) and applies modifiers only to that step. This prevents `FIRST` from being applied to an intermediate `PSM_LOCATIONS` step even if an older `QueryPlanner` build still puts the modifier there.
-
-3. The pipeline detects an empty/useless fast-path result and falls back to LLM-generated SQL. `DatabaseManager.executeLlmGeneratedQuery()` already injects `TOP 200` when no `TOP` is present.
+1. `QueryPlanner.convertLlmPlan()` sorts by priority, normalizes and validates relations, rejects invalid first-step filtering/enrichment, and preserves explicit modifiers on the step where the LLM placed them. A top-level modifier is distributed only when no step already declares one.
+2. `OllamaService.executePlan()` selects the last executable step with a modifier, including dependent `use_previous_codes` steps. It applies the modifier after the relation has been evaluated, so `FIRST`/`OLDEST` operates on the intended intersection.
+3. The redundant-detail guard prevents a following detail step from rendering the same selected location twice.
+4. The pipeline detects an empty/useless fast-path result and falls back to LLM-generated SQL. `DatabaseManager.executeLlmGeneratedQuery()` already injects `TOP 200` when no `TOP` is present.
 
 4. If the SQL fallback itself returns zero rows, `isUselessSqlResult()` now detects `count=0` / empty `results` and falls back to the agent loop instead of presenting an empty table.
 
@@ -1247,7 +1506,7 @@ result.addToolCall(toolName, args, toolResult);           // 2nd record — same
 
 This inflated every apparent "redundant tool call" count by roughly 2x on top of any real LLM-driven redundancy, making the true scope of tool-selection bugs hard to gauge from the UI or logs alone.
 
-**Fix:** Remove the first `addToolCall()` call in each branch and keep only the one after `postProcess()`, since that reflects the final (possibly enhanced/filtered) result that actually gets rendered and fed back to the LLM. The `check_reports` expansion path (`callCheckReports()`) already records its own sub-calls internally, so its branch must skip the post-`postProcess()` record too, to avoid double-counting the expanded calls instead.
+**Fix:** Tool execution now records one `ToolCallRecord` per real invocation. `OllamaService` no longer expands or dispatches `check_reports` through a tool-specific branch; report-type expansion belongs in the registered provider/catalog implementation. Duplicate detection is shared through `AgentResult.findEquivalentCallResult()` across the fast path and agent loop.
 
 ### `toolCalls` in the `/api/chat` JSON response always showed `args: {}` and a repeated/shared `result`
 
@@ -1356,7 +1615,7 @@ Cannot construct instance of `java.util.LinkedHashMap` ... from String value ('{
 
 **Symptom:** A query asking for a paginated list such as *"Show first 50 locations under PSM Central"* unexpectedly triggers `hardcode_query` on the #1 result in the list instead of displaying all 50 rows.
 
-**Cause:** Cloud reasoning models (like `deepseek-v4-flash`) can exhibit semantic confusion when evaluating the word `"first"` in `"first 50"`. Without explicit disambiguation, the model can interpret `"first"` as a request for a single-location detail view (`modifier="FIRST"` / `autoFetchFirst=true`), causing the backend (`applyModifier` / `runPostStepChains`) to grab the first code and call `hardcode_query`.
+**Cause:** Cloud reasoning models (like `deepseek-v4-flash`) can exhibit semantic confusion when evaluating the word `"first"` in `"first 50"`. Without explicit disambiguation, the model can interpret `"first"` as a request for a single-location detail view (`modifier="FIRST"`), causing the backend modifier handler to fetch the first code and call the catalog-resolved detail tool.
 
 **Fix:** Added an explicit disambiguation rule to `KEYWORD_EXTRACT_PROMPT` in `OllamaService.java`: when words like `'first'` or `'top'` are followed by a number (e.g. `'first 50 locations'`, `'top 20'`), this is exclusively a row count limit (`limit: 50`); the LLM is instructed never to set `modifier='FIRST'`, `showDetails=true`, or `autoFetchFirst=true` in that case.
 
@@ -1398,9 +1657,10 @@ This ensures the session memory is refreshed with the actual selected code after
 2. `crossFilter()` couldn't find a `results` array in either input and silently returned the second result unchanged.
 
 **Fix:**
-1. `extractCodesFromResult()` now includes a 4th extraction case that reads `LOC_CD` from the `withReport` array. This ensures `lastCodes` contains only the codes that have the report, so subsequent steps narrow correctly.
-2. `crossFilter()` now detects the `withReport` format in the second result and filters the first result's rows to only codes that appear in `withReport`.
-3. `executePlan()` now appends a generalized intersection summary when two or more `filter_previous` steps are chained, showing which codes survived all filters.
+1. `extractCodesFromResult()` now recursively collects `LOC_CD` and `CURRENT_LOC_CD` from standardized and legacy nested response shapes.
+2. `crossFilter()` uses those generic code sets and fails closed when either side has no usable codes or processing fails.
+3. `QueryPlanner` validates relation support, first-step constraints, and consumed fields before execution.
+4. `executePlan()` applies `filter_previous` after the current tool result is available and appends a generalized intersection summary when two or more filters are chained.
 
 ### LLM inventing unknown step types
 
@@ -1515,6 +1775,8 @@ If the error persists, check the Tomcat console for an earlier `JasperException:
 ## Notes
 
 - The project expects location data in the `ais` schema of SQL Server.
+- Protected routes require a trusted Tomcat/container principal. Local BASIC users belong in the active `$CATALINA_BASE/conf/tomcat-users.xml`, never inside the WAR; production should use enterprise SSO/Realm integration over HTTPS.
+- Authentication/RBAC is operational when the active Realm accepts credentials: anonymous protected routes return `401`, an authenticated user without the required role returns `403`, and an administrator can access the schema route. A repeated login prompt plus authenticated curl `401` still means Tomcat identity validation failed.
 - The assistant requires either a Tencent Cloud API key or a reachable Ollama server, plus a SQL Server database.
 - The verification graph is compiled once at `ChatServlet.init()` and reused for all requests.
 - If `tencent.api.key` is set, all LLM calls — including verification — use Tencent Cloud. Ollama config is ignored.
@@ -1525,5 +1787,21 @@ If the error persists, check the Tomcat console for an earlier `JasperException:
 - Likewise, `js/chat.js` must live under `src/main/webapp/js/chat.js` — the same WAR-packaging rule applies to any static asset referenced from `index.jsp`. Its `<script src="<%= request.getContextPath() %>/js/chat.js">` tag will 404 if the file isn't under `src/main/webapp/`.
 - `index.jsp` sets `isELIgnored="true"` because its script relies on JS template-literal syntax (`` `${...}` ``) which Jasper would otherwise try to evaluate as JSP Expression Language and fail with `javax.el.ELException: Function [...] not found`. Keep this directive if you add more inline scripts to the page.
 - **Resolved:** the "Verification Note" banner appearing on every response has been root-caused and fixed — see [Known issues & fixes](#known-issues--fixes) ("Verification Note" banner appears on every response even with verification disabled).
+- **Security:** `ChatServlet` sanitizes the final answer with the OWASP Java HTML Sanitizer before JSON serialization. The Java 8 dependency is resolved; verify it remains packaged in the WAR.
 - **Open investigation:** `search_by_name` / `DatabaseManager.searchByName()` can return geography-false-positive matches for queries like a PSM/district name that has no exact match — e.g. searching for `"Central"` can surface `"Hong Kong Central Library"` (physically in Causeway Bay) or `"Queen's Road Central"` (a street name spanning multiple districts), because the underlying `LIKE '%term%'` matches `LOC_NAME`/`ADDRESS` text with no district/geography anchoring. This may be an inherent limitation of free-text name search rather than a pure SQL bug — the agent loop arguably should not fall back to a plain name search for what is really a geography/PSM question in the first place. The `PSM/`-prefix-restricted, slash-anchored matching added to `getLocationsByPsm()` (see [New capabilities](#new-capabilities)) does not apply here since `searchByName()` searches `LOC_NAME`/`ADDRESS`, not `PSM`.
 - **Open investigation:** the LLM/agent loop can still invent plausible-sounding but non-existent PSM name variants (e.g. trying `CENTRAL DISTRICT`, `CENTRAL OFFICE` after `CENTRAL` returns 0 rows) instead of cross-referencing the already-fetched `list_psms` result for a real fuzzy match. The tool-call deduplication (see [New capabilities](#new-capabilities)) prevents these invented variants from being *re-tried* if the exact same guess recurs, but does not stop the LLM from inventing a *new* wrong guess each iteration. Not yet fixed — would likely require either a stronger `SYSTEM_PROMPT` instruction or a Java-side fuzzy-match fallback in `postProcess()` that runs when `locations_by_psm` returns 0 rows.
+
+
+### ArcGIS HTTP 401 / HTTPS timeout
+
+Observed diagnostics:
+
+```text
+TCP 443: failed
+TCP 80: succeeded
+HTTP ArcGIS metadata: 401 Unauthorized
+```
+
+This proves that the iframe receives the code but the ArcGIS Web Adaptor requires authentication. Test with `Invoke-WebRequest -UseDefaultCredentials`. For browser-based integrated authentication, add the server to the approved intranet zone and configure ArcGIS JS `esriConfig.request.trustedServers`, plus credentialed CORS. Production should prefer a fixed-path same-origin reverse proxy. Do not create an unrestricted proxy.
+
+The ArcGIS SDK logs layer failures before application catch handlers run; the plugin must still replace the iframe with a friendly message. A browser network stack trace is not evidence that `locCd` parsing failed.

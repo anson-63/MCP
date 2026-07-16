@@ -70,7 +70,7 @@ public class FormatterNode implements GraphNode {
         // Show retry count if retried
         if (state.getRetryCount() > 0) {
             html.append("<div style='color:#aaa;margin-top:6px;font-size:0.82rem;'>")
-                    .append("ℹ️ This answer was regenerated ")
+                    .append(" This answer was regenerated ")
                     .append(state.getRetryCount())
                     .append(state.getRetryCount() == 1 ? " time" : " times")
                     .append(" before being shown.")

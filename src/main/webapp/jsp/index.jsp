@@ -23,6 +23,7 @@
                 height: 100vh;
                 display: flex;
                 flex-direction: column;
+                overflow-x: hidden;
             }
 
             header {
@@ -226,7 +227,6 @@
             .message-row .message.assistant.has-map {
                 max-width: none;
                 flex: 1 1 auto;
-                min-width: 0;
                 /* allow the message to shrink/scroll instead of overflowing the row */
             }
 
@@ -765,6 +765,40 @@
             .ais-detail-btn:active {
                 background-color: #0f3f7a;
             }
+            
+            .location-map-tabs {
+			    display: flex;
+			    flex-wrap: wrap;
+			    gap: 6px;
+			    margin-bottom: 10px;
+			}
+			
+			.location-map-tab {
+			    border: 1px solid #bbb;
+			    border-radius: 5px;
+			    padding: 6px 9px;
+			    background: #fff;
+			    cursor: pointer;
+			    font-family: monospace;
+			}
+			
+			.location-map-tab.active {
+			    color: #fff;
+			    background: #2563eb;
+			    border-color: #2563eb;
+			}
+			
+			.location-map-panel[hidden] {
+			    display: none !important;
+			}
+			
+			.location-map-error {
+			    padding: 16px;
+			    color: #842029;
+			    background: #f8d7da;
+			    border: 1px solid #f5c2c7;
+			    border-radius: 6px;
+			}
         </style>
     </head>
 
